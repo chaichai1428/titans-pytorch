@@ -33,8 +33,8 @@ from titans_pytorch import (
 )
 
 # constants - 训练参数
-NUM_BATCHES = 2000       # 训练批次数量
-BATCH_SIZE = 4           # 批量大小
+NUM_BATCHES = 2       # 训练批次数量
+BATCH_SIZE = 2000         # 批量大小
 GRADIENT_ACCUMULATE_EVERY = 2  # 梯度累积
 LEARNING_RATE = 8e-5     # 学习率
 VALIDATE_EVERY = 50      # 验证频率
@@ -45,20 +45,20 @@ MAX_ANSWER_LEN = 128     # 回答最大长度
 GENERATE_LENGTH = 128     # 生成长度
 SHOULD_GENERATE = True
 
-# 增强模型设置
-DIM = 128        # 模型维度
-DIM_HEAD = 64    # 每个头的维度
-HEADS = 4        # 注意力头数量
-DEPTH = 4        # 层数
-MEMORY_DEPTH = 2 # 内存深度
-WINDOW_SIZE = 32 # 窗口大小
-MEM_SEGMENT_LEN = 16  # 内存段长度
-MEM_BATCH_SIZE = 32  # 内存批量大小
+# 增强模型设置 - 提高模型记忆能力
+DIM = 512        # 增加模型维度到512
+DIM_HEAD = 64    # 保持每个头的维度
+HEADS = 8        # 增加注意力头数量到8
+DEPTH = 6        # 增加深度到6层
+MEMORY_DEPTH = 3 # 增加内存深度到3
+WINDOW_SIZE = 64 # 增加窗口大小到64
+MEM_SEGMENT_LEN = 32  # 增加内存段长度到32
+MEM_BATCH_SIZE = 64  # 增加内存批量大小到64
 
-# 神经记忆设置
-NUM_PERSIST_MEM = 6  # 持久内存数量
-NUM_LONGTERM_MEM = 8 # 长期内存数量
-NEURAL_MEM_LAYERS = (1, 2, 3)  # 使用神经记忆的层
+# 神经记忆设置 - 增强记忆能力
+NUM_PERSIST_MEM = 12  # 增加持久内存数量到12
+NUM_LONGTERM_MEM = 16 # 增加长期内存数量到16
+NEURAL_MEM_LAYERS = (1, 2, 3, 4)  # 增加使用神经记忆的层数
 NEURAL_MEM_GATE_ATTN_OUTPUT = True  # 门控注意力输出
 NEURAL_MEM_MOMENTUM = False  # 内存动量
 NEURAL_MEM_MOMENTUM_ORDER = 1
@@ -107,26 +107,51 @@ def encode_text(text):
     """将普通文本编码为token"""
     return torch.tensor([ord(c) for c in text], dtype=torch.long)
 
-def encode_instruction_answer_pair(instruction, answer):
-    """编码指令-回答对"""
+def encode_instruction_answer_pair(instruction, answer, input_text=""):
+    """编码指令-回答对，支持Project Zomboid格式的数据"""
     # 截断过长的输入
     if len(instruction) > MAX_INSTRUCTION_LEN:
         instruction = instruction[:MAX_INSTRUCTION_LEN]
-    if len(answer) > MAX_ANSWER_LEN:
-        answer = answer[:MAX_ANSWER_LEN]
+    
+    # 处理输入文本
+    input_text = input_text or ""  # 确保input不是None
+    
+    # 处理回答，移除<think>...</think>标签和内容
+    clean_answer = answer
+    if "<think>" in answer and "</think>" in answer:
+        think_parts = answer.split("</think>")
+        if len(think_parts) > 1:
+            clean_answer = think_parts[1].strip()
+    
+    if "<answer>" in clean_answer:
+        clean_answer = clean_answer.replace("<answer>", "").replace("</answer>", "")
+    
+    if len(clean_answer) > MAX_ANSWER_LEN:
+        clean_answer = clean_answer[:MAX_ANSWER_LEN]
         
     # 编码为token序列
     inst_tokens = encode_text(instruction)
-    ans_tokens = encode_text(answer)
     
-    # 构建完整序列：[INST] instruction [SEP] [ANS] answer
-    seq = torch.cat([
-        torch.tensor([INSTRUCTION_TOKEN]),
-        inst_tokens,
-        torch.tensor([SEP_TOKEN]),
-        torch.tensor([ANSWER_TOKEN]),
-        ans_tokens
-    ])
+    # 如果有输入文本，添加输入文本
+    if input_text:
+        input_tokens = encode_text(input_text)
+        # 构建序列：[INST] instruction [SEP] input [SEP] [ANS] answer
+        seq = torch.cat([
+            torch.tensor([INSTRUCTION_TOKEN]),
+            inst_tokens,
+            torch.tensor([SEP_TOKEN]),
+            input_tokens,
+            torch.tensor([SEP_TOKEN, ANSWER_TOKEN]),
+            encode_text(clean_answer)
+        ])
+    else:
+        # 构建序列：[INST] instruction [SEP] [ANS] answer
+        seq = torch.cat([
+            torch.tensor([INSTRUCTION_TOKEN]),
+            inst_tokens,
+            torch.tensor([SEP_TOKEN, ANSWER_TOKEN]),
+            encode_text(clean_answer)
+        ])
     
     return seq
 
@@ -156,20 +181,35 @@ def create_custom_mac_block_mask(seq_len, window_size, persist_mem_len, sliding_
     return block_mask
 
 # 测试模型生成
-def test_model_generation(model, instruction, device, max_length=100):
-    """测试模型对指令的回答生成能力"""
+def test_model_generation(model, instruction, device, max_length=100, input_text=""):
+    """测试模型对指令的回答生成能力，支持输入文本"""
     model.eval()
     
-    # 准备输入序列：[INST] instruction [SEP] [ANS]
+    # 准备输入序列
     inst_tokens = encode_text(instruction).to(device)
-    input_seq = torch.cat([
-        torch.tensor([INSTRUCTION_TOKEN], device=device),
-        inst_tokens,
-        torch.tensor([SEP_TOKEN, ANSWER_TOKEN], device=device)
-    ])
+    
+    if input_text:
+        # [INST] instruction [SEP] input [SEP] [ANS]
+        input_tokens = encode_text(input_text).to(device)
+        input_seq = torch.cat([
+            torch.tensor([INSTRUCTION_TOKEN], device=device),
+            inst_tokens,
+            torch.tensor([SEP_TOKEN], device=device),
+            input_tokens,
+            torch.tensor([SEP_TOKEN, ANSWER_TOKEN], device=device)
+        ])
+    else:
+        # [INST] instruction [SEP] [ANS]
+        input_seq = torch.cat([
+            torch.tensor([INSTRUCTION_TOKEN], device=device),
+            inst_tokens,
+            torch.tensor([SEP_TOKEN, ANSWER_TOKEN], device=device)
+        ])
     
     # 输出原始提示
     print(f'指令: {instruction}')
+    if input_text:
+        print(f'输入: {input_text}')
     print('='*50)
     
     # 生成回答
@@ -227,7 +267,7 @@ except Exception as e:
 # 创建模型实例
 try:
     model = MemoryAsContextTransformer(
-        num_tokens = 256,  # 基本ASCII + 特殊标记
+        num_tokens = 512,  # 基本ASCII + 特殊标记
         dim = DIM,
         depth = DEPTH,
         segment_len = WINDOW_SIZE,
@@ -261,7 +301,7 @@ except Exception as e:
 
 class InstructionAnswerDataset(Dataset):
     """用于处理指令-回答对的数据集"""
-    def __init__(self, data_file, max_len=192):
+    def __init__(self, data_file, max_len=512):  # 增加最大长度以适应wiki数据
         super().__init__()
         self.max_len = max_len
         self.data = []
@@ -269,18 +309,45 @@ class InstructionAnswerDataset(Dataset):
         # 加载数据
         print(f"加载数据文件: {data_file}")
         try:
-            with open(data_file, 'r', encoding='utf-8') as f:
-                raw_data = json.load(f)
-                
-            # 处理数据
-            for item in raw_data:
-                if 'instruction' in item and 'answer' in item:
-                    instruction = item['instruction']
-                    answer = item['answer']
-                    # 编码并添加到数据中
-                    encoded = encode_instruction_answer_pair(instruction, answer)
-                    if len(encoded) <= self.max_len:
-                        self.data.append(encoded)
+            # 判断文件类型（json或jsonl）
+            if data_file.endswith('.jsonl'):
+                # JSONL格式处理 - 一行一个JSON对象
+                with open(data_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.strip():  # 跳过空行
+                            try:
+                                item = json.loads(line)
+                                # wiki3数据格式适配
+                                instruction = item.get('instruction', '')
+                                answer = item.get('output', '') or item.get('answer', '')
+                                input_text = item.get('input', '')
+                                
+                                # 编码并添加到数据中
+                                encoded = encode_instruction_answer_pair(instruction, answer, input_text)
+                                if len(encoded) <= self.max_len:
+                                    self.data.append(encoded)
+                                else:
+                                    print(f"警告: 序列长度 {len(encoded)} 超过最大长度 {self.max_len}，跳过")
+                            except json.JSONDecodeError:
+                                print(f"警告: 跳过无效的JSONL行")
+            else:
+                # 常规JSON文件处理
+                with open(data_file, 'r', encoding='utf-8') as f:
+                    raw_data = json.load(f)
+                    
+                # 处理数据
+                for item in raw_data:
+                    if 'instruction' in item and ('answer' in item or 'output' in item):
+                        instruction = item['instruction']
+                        answer = item.get('output', '') or item.get('answer', '')
+                        input_text = item.get('input', '')
+                        
+                        # 编码并添加到数据中
+                        encoded = encode_instruction_answer_pair(instruction, answer, input_text)
+                        if len(encoded) <= self.max_len:
+                            self.data.append(encoded)
+                        else:
+                            print(f"警告: 序列长度 {len(encoded)} 超过最大长度 {self.max_len}，跳过")
                     
             print(f"成功加载 {len(self.data)} 个指令-回答对")
         except Exception as e:
@@ -319,7 +386,7 @@ class InstructionAnswerDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-def create_or_load_datasets(data_file="data/instruction_dataset.json"):
+def create_or_load_datasets(data_file="data/wiki3.jsonl"):
     """创建或加载数据集"""
     # 确保数据目录存在
     os.makedirs(os.path.dirname(data_file), exist_ok=True)
@@ -349,25 +416,39 @@ def create_or_load_datasets(data_file="data/instruction_dataset.json"):
             sample_pairs.append({"instruction": instruction, "answer": answer})
         
         # 保存示例数据
-        with open(data_file, 'w', encoding='utf-8') as f:
+        out_file = data_file.replace('.jsonl', '.json') if data_file.endswith('.jsonl') else data_file
+        with open(out_file, 'w', encoding='utf-8') as f:
             json.dump(sample_pairs, f, ensure_ascii=False, indent=2)
     
+    print(f"开始加载数据集: {data_file}")
     # 创建数据集
     full_dataset = InstructionAnswerDataset(data_file)
     
-    # 分割数据集
-    train_size = int(0.8 * len(full_dataset))
+    print(f"全数据集大小: {len(full_dataset)} 样本")
+    
+    # 分割数据集时，确保PZ相关数据分布均衡
+    train_size = int(0.9 * len(full_dataset))  # 增加训练集比例到90%
     val_size = len(full_dataset) - train_size
     
     if val_size == 0:
         # 数据太少，只用于训练
         train_dataset = full_dataset
         val_dataset = full_dataset
+        print("警告: 数据量太小，验证集与训练集相同")
     else:
         # 随机分割
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            full_dataset, [train_size, val_size]
-        )
+        # 设置随机种子确保可重复性
+        torch.manual_seed(42)
+        indices = torch.randperm(len(full_dataset))
+        
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:]
+        
+        train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+        
+        print(f"训练集大小: {len(train_dataset)} 样本")
+        print(f"验证集大小: {len(val_dataset)} 样本")
     
     return train_dataset, val_dataset
 
@@ -435,6 +516,10 @@ val_losses = []
 # 训练循环
 print(f"开始训练 {NUM_BATCHES} 批次...")
 try:
+    best_val_loss = float('inf')
+    patience_counter = 0
+    patience_limit = 5  # 连续5次验证损失没有改善就降低学习率
+    
     for i in tqdm.tqdm(range(start_batch, NUM_BATCHES), mininterval=1., desc='训练中'):
         model.train()
         
@@ -480,8 +565,28 @@ try:
                 try:
                     val_data_batch = next(val_loader)
                     val_loss = model(val_data_batch, return_loss=True)
-                    val_losses.append(val_loss.item())
-                    print(f'验证损失: {val_loss.item():.4f}')
+                    current_val_loss = val_loss.item()
+                    val_losses.append(current_val_loss)
+                    print(f'验证损失: {current_val_loss:.4f}')
+                    
+                    # 学习率调度 - 如果验证损失连续多次没有改善，降低学习率
+                    if current_val_loss < best_val_loss:
+                        best_val_loss = current_val_loss
+                        patience_counter = 0
+                        # 保存最佳模型
+                        save_checkpoint(model, optim, i, current_val_loss, "instruction_best.pt")
+                        print(f"新的最佳验证损失: {best_val_loss:.4f}, 已保存最佳模型")
+                    else:
+                        patience_counter += 1
+                        print(f"验证损失未改善，耐心计数: {patience_counter}/{patience_limit}")
+                        
+                        if patience_counter >= patience_limit:
+                            # 降低学习率
+                            for param_group in optim.param_groups:
+                                param_group['lr'] *= 0.5  # 学习率减半
+                            new_lr = param_group['lr']
+                            print(f"降低学习率至: {new_lr}")
+                            patience_counter = 0  # 重置耐心计数器
                 except Exception as e:
                     print(f"验证错误: {e}")
         
@@ -490,8 +595,8 @@ try:
             try:
                 print(f"\n批次 {i+1} 生成样本:")
                 sample_instructions = [
-                    "What is Project Zomboid?",
-                    "How do I survive the first day in Project Zomboid?"
+                    "What critical survival action should the agent take immediately upon hearing an approaching helicopter while outdoors?",
+                    "How can the agent gain advance warning of the helicopter event during Days 6-9, including the specific tool and frequency to monitor?"
                 ]
                 for inst in sample_instructions:
                     test_model_generation(model, inst, device, GENERATE_LENGTH)
@@ -513,11 +618,11 @@ try:
     print("最终模型评估:")
     if SHOULD_GENERATE:
         test_instructions = [
-            "What is Project Zomboid?",
-            "How do I find food in Project Zomboid?",
-            "What's the best way to kill zombies?",
-            "How do I level up my skills?",
-            "What should I do when I get injured?"
+            "What critical survival action should the agent take immediately upon hearing an approaching helicopter while outdoors?",
+            "How can the agent gain advance warning of the helicopter event during Days 6-9, including the specific tool and frequency to monitor?",
+            "What specific steps must the agent follow to obtain gasoline from a gas station pump after the main power grid has shut off?",
+            "What type of location is a house heavily barricaded with wooden planks from the outside likely to be, and what tools are needed to remove the external barricades?",
+            "What potential delayed consequence might occur after the agent sustains a scratch from a zombie, and if the \"Sick\" moodle appears afterward, what is the most likely cause and outcome?"
         ]
         for inst in test_instructions:
             test_model_generation(model, inst, device, GENERATE_LENGTH)
