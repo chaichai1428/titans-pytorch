@@ -172,3 +172,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+checkpoint/
+data/
+torch-2.2.0-cu121.whl
