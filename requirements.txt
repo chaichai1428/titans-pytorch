@@ -1,0 +1,9 @@
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.10.0
+tqdm>=4.64.0
+numpy>=1.20.0
+einops>=0.6.0
+accelerate>=0.20.0
+tensordict>=0.1.0
+assoc-scan>=0.1.0 

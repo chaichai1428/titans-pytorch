@@ -1,6 +1,29 @@
 train_local.py
 .DS_Store
 
+# Project specific - 重要文件排除
+# 数据和生成内容
+/data/
+/logs/
+/checkpoint/
+/qwen3-pz-finetuned/
+/qwen3_pz_finetuned/
+/.github/
+/units/
+/venv/
+/checkpoint/
+/qwen3_pz_finetuned/
+
+# 中间文件和结果
+*.npy
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.onnx
+instruction_*_losses.npy
+torch-*.whl
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -97,25 +120,9 @@ ipython_config.py
 #   install all needed dependencies.
 #Pipfile.lock
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
-
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+# poetry and other package management
 #poetry.lock
-
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#pdm.lock
-#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
-#   in version control.
-#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
+pyproject.toml
 .pdm.toml
 .pdm-python
 .pdm-build/
@@ -163,15 +170,11 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+# PyCharm and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
 
-# PyPI configuration file
-.pypirc
-checkpoint/
-data/
-torch-2.2.0-cu121.whl
+
+

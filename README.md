@@ -1,6 +1,83 @@
-<img src="./fig2.png" width="400px"></img>
+# Titans-PyTorch
 
-<img src="./fig1.png" width="400px"></img>
+A PyTorch implementation of neural memory frameworks with fine-tuning capabilities for language models like Qwen3.
+
+## Project Overview
+
+Titans-PyTorch is a framework for building and training neural networks with memory mechanisms, specifically designed for large language model fine-tuning tasks. The project focuses on implementing memory-augmented neural networks and providing tools for training, fine-tuning, and evaluating these models.
+
+## Features
+
+- Neural memory mechanisms implementation
+- Transformer model architectures with memory augmentation
+- Fine-tuning pipeline for language models (e.g., Qwen3)
+- Project Zomboid domain-specific training
+- Path management utilities for consistent file handling
+
+## Project Structure
+
+- `titans_pytorch/`: Core module containing implementations of memory models and utilities
+  - `memory_models.py`: Base memory model implementations
+  - `neural_memory.py`: Neural memory implementation
+  - `mac_transformer.py`: Memory-augmented contextual transformer
+  - `path_manager.py`: Utilities for path management and configuration
+
+- `train_instruction.py`: Script for fine-tuning models on instruction datasets
+- `test_model_performance.py`: Script for testing trained models
+
+## Requirements
+
+- Python 3.8+
+- PyTorch 2.0+
+- Transformers 4.30+
+- Datasets
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/titans-pytorch.git
+cd titans-pytorch
+```
+
+2. Create a virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+3. Install the dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+### Fine-tuning a model on an instruction dataset
+
+```bash
+python train_instruction.py
+```
+
+### Testing model performance
+
+```bash
+python test_model_performance.py
+```
+
+## Configuration
+
+- Model parameters and training settings can be configured in the respective Python scripts.
+- Data paths and directories are managed through the `path_manager.py` module.
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgments
+
+- This project builds upon transformer architectures and neural memory mechanisms from various research papers.
+- Thanks to the PyTorch and Hugging Face teams for their excellent libraries.
 
 ## Titans - Pytorch
 
@@ -110,46 +187,4 @@ $ python train_mac.py
 }
 ```
 
-```bibtex
-@article{Zhu2024HyperConnections,
-    title   = {Hyper-Connections},
-    author  = {Defa Zhu and Hongzhi Huang and Zihao Huang and Yutao Zeng and Yunyao Mao and Banggu Wu and Qiyang Min and Xun Zhou},
-    journal = {ArXiv},
-    year    = {2024},
-    volume  = {abs/2409.19606},
-    url     = {https://api.semanticscholar.org/CorpusID:272987528}
-}
-```
-
-```bibtex
-@article{Zhou2024ValueRL,
-    title   = {Value Residual Learning For Alleviating Attention Concentration In Transformers},
-    author  = {Zhanchao Zhou and Tianyi Wu and Zhiyun Jiang and Zhenzhong Lan},
-    journal = {ArXiv},
-    year    = {2024},
-    volume  = {abs/2410.17897},
-    url     = {https://api.semanticscholar.org/CorpusID:273532030}
-}
-```
-
-```bibtex
-@software{Kyrylov_Accelerated_Scan_2024,
-    author  = {Kyrylov, Volodymyr},
-    doi     = {10.5281/zenodo.10600962},
-    title   = {Accelerated Scan},
-    version = {0.1.2},
-    year    = {2024}
-}
-```
-
-```bibtex
-@misc{wang2025testtimeregressionunifyingframework,
-    title   = {Test-time regression: a unifying framework for designing sequence models with associative memory},
-    author  = {Ke Alexander Wang and Jiaxin Shi and Emily B. Fox},
-    year    = {2025},
-    eprint  = {2501.12352},
-    archivePrefix = {arXiv},
-    primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2501.12352},
-}
 ```

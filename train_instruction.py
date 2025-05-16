@@ -4,6 +4,22 @@ import gzip
 import numpy as np
 import json
 import os
+import logging
+from datasets import Dataset as HFDataset
+
+# 设置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 导入自定义的path_manager模块
+from titans_pytorch.path_manager import (
+  get_data_file_path,
+  get_model_output_path,
+  get_final_model_path,
+  get_interrupted_model_path,
+  get_logs_dir,
+  ensure_dir_exists
+)
 
 # 禁用PyTorch动态编译和JIT
 import torch
@@ -20,623 +36,624 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
-try:
-    from adam_atan2_pytorch import AdoptAtan2
-except ImportError:
-    print("AdoptAtan2 not found, using Adam optimizer instead")
-    from torch.optim import Adam as AdoptAtan2
-
-from titans_pytorch import (
-    MemoryAsContextTransformer,
-    MemoryMLP,
-    MemoryAttention
+from transformers import (
+  AutoModelForCausalLM,
+  AutoTokenizer,
+  TrainingArguments,
+  Trainer,
+  DataCollatorForLanguageModeling
 )
 
-# constants - 训练参数
-NUM_BATCHES = 2       # 训练批次数量
-BATCH_SIZE = 2000         # 批量大小
-GRADIENT_ACCUMULATE_EVERY = 2  # 梯度累积
-LEARNING_RATE = 8e-5     # 学习率
-VALIDATE_EVERY = 50      # 验证频率
-GENERATE_EVERY = 100     # 生成频率
-SAVE_EVERY = 200         # 保存频率
-MAX_INSTRUCTION_LEN = 64   # 指令最大长度
-MAX_ANSWER_LEN = 128     # 回答最大长度
-GENERATE_LENGTH = 128     # 生成长度
+# 全局变量，在main函数中初始化
+model = None
+tokenizer = None
+generation_config = {
+  "temperature": 0.7,
+  "top_p": 0.95,
+  "top_k": 50,
+  "presence_penalty": 1.1,
+}
+
+# 训练参数
+MAX_LENGTH = 128  # 减少最大序列长度以节省内存
+BATCH_SIZE = 2 if torch.cuda.is_available() else 1  # GPU可使用更大的批量
+LEARNING_RATE = 5e-5  # 学习率
+NUM_EPOCHS = 1    # 减少训练轮数以快速完成
+GRADIENT_ACCUMULATION_STEPS = 4  # 梯度累积步数
+SAVE_EVERY = 50      # 保存检查点频率
+VALIDATE_EVERY = 25   # 验证频率
+PRIME_LENGTH = 32     # 减小提示长度
+GENERATE_LENGTH = 64  # 减小生成长度
 SHOULD_GENERATE = True
 
-# 增强模型设置 - 提高模型记忆能力
-DIM = 512        # 增加模型维度到512
-DIM_HEAD = 64    # 保持每个头的维度
-HEADS = 8        # 增加注意力头数量到8
-DEPTH = 6        # 增加深度到6层
-MEMORY_DEPTH = 3 # 增加内存深度到3
-WINDOW_SIZE = 64 # 增加窗口大小到64
-MEM_SEGMENT_LEN = 32  # 增加内存段长度到32
-MEM_BATCH_SIZE = 64  # 增加内存批量大小到64
+# 模型参数 - 改为使用更小的Qwen3-0.6B
+MODEL_NAME = "Qwen/Qwen3-0.6B"
+OUTPUT_DIR = get_model_output_path()  # 使用path_manager
 
-# 神经记忆设置 - 增强记忆能力
-NUM_PERSIST_MEM = 12  # 增加持久内存数量到12
-NUM_LONGTERM_MEM = 16 # 增加长期内存数量到16
-NEURAL_MEM_LAYERS = (1, 2, 3, 4)  # 增加使用神经记忆的层数
-NEURAL_MEM_GATE_ATTN_OUTPUT = True  # 门控注意力输出
-NEURAL_MEM_MOMENTUM = False  # 内存动量
-NEURAL_MEM_MOMENTUM_ORDER = 1
-NEURAL_MEM_QK_NORM = False  # QK规范化
-NEURAL_MEM_MAX_LR = 1e-3  # 最大学习率
-USE_MEM_ATTENTION_MODEL = True  # 使用内存注意力模型
-SLIDING_WINDOWS = False
-STORE_ATTN_POOL_CHUNKS = False
-MEMORY_MODEL_PER_LAYER_LEARNED_LR = False
-NEURAL_MEM_WEIGHT_RESIDUAL = True
-NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW = False
-
-# 性能相关设置 - 禁用加速功能
-USE_ACCELERATED_SCAN = False  
-USE_FLEX_ATTN = False         
-USE_FAST_INFERENCE = False    
-
-# 特殊标记
-INSTRUCTION_TOKEN = 1  # 指令标记的ID
-ANSWER_TOKEN = 2      # 回答标记的ID
-SEP_TOKEN = 3         # 分隔符标记的ID
-PAD_TOKEN = 0         # 填充标记的ID
-
-# helpers
-def cycle(loader):
-    while True:
-        for data in loader:
-            yield data
-
-def decode_token(token):
-    if token == INSTRUCTION_TOKEN:
-        return "[INST]"
-    elif token == ANSWER_TOKEN:
-        return "[ANS]"
-    elif token == SEP_TOKEN:
-        return "[SEP]"
-    elif token == PAD_TOKEN:
-        return "[PAD]"
-    else:
-        return str(chr(max(32, token)))
-
-def decode_tokens(tokens):
-    return ''.join(list(map(decode_token, tokens)))
-
-def encode_text(text):
-    """将普通文本编码为token"""
-    return torch.tensor([ord(c) for c in text], dtype=torch.long)
-
-def encode_instruction_answer_pair(instruction, answer, input_text=""):
-    """编码指令-回答对，支持Project Zomboid格式的数据"""
-    # 截断过长的输入
-    if len(instruction) > MAX_INSTRUCTION_LEN:
-        instruction = instruction[:MAX_INSTRUCTION_LEN]
-    
-    # 处理输入文本
-    input_text = input_text or ""  # 确保input不是None
-    
-    # 处理回答，移除<think>...</think>标签和内容
-    clean_answer = answer
-    if "<think>" in answer and "</think>" in answer:
-        think_parts = answer.split("</think>")
-        if len(think_parts) > 1:
-            clean_answer = think_parts[1].strip()
-    
-    if "<answer>" in clean_answer:
-        clean_answer = clean_answer.replace("<answer>", "").replace("</answer>", "")
-    
-    if len(clean_answer) > MAX_ANSWER_LEN:
-        clean_answer = clean_answer[:MAX_ANSWER_LEN]
-        
-    # 编码为token序列
-    inst_tokens = encode_text(instruction)
-    
-    # 如果有输入文本，添加输入文本
-    if input_text:
-        input_tokens = encode_text(input_text)
-        # 构建序列：[INST] instruction [SEP] input [SEP] [ANS] answer
-        seq = torch.cat([
-            torch.tensor([INSTRUCTION_TOKEN]),
-            inst_tokens,
-            torch.tensor([SEP_TOKEN]),
-            input_tokens,
-            torch.tensor([SEP_TOKEN, ANSWER_TOKEN]),
-            encode_text(clean_answer)
-        ])
-    else:
-        # 构建序列：[INST] instruction [SEP] [ANS] answer
-        seq = torch.cat([
-            torch.tensor([INSTRUCTION_TOKEN]),
-            inst_tokens,
-            torch.tensor([SEP_TOKEN, ANSWER_TOKEN]),
-            encode_text(clean_answer)
-        ])
-    
-    return seq
-
-# 自定义create_block_mask函数
-def create_custom_mac_block_mask(seq_len, window_size, persist_mem_len, sliding_window_attn):
-    """创建自定义注意力mask，无需Triton"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # 创建一个简单的block mask
-    total_len = seq_len + persist_mem_len
-    block_mask = torch.ones(1, 1, total_len, total_len, device=device)
-    
-    # 持久化内存对所有位置都可见
-    block_mask[:, :, :, :persist_mem_len] = 1
-    
-    # 自身位置和周围窗口可见
-    for i in range(persist_mem_len, total_len):
-        start = max(persist_mem_len, i - window_size)
-        end = min(total_len, i + window_size + 1)
-        block_mask[:, :, i, start:end] = 1
-    
-    # 前持久化内存部分对所有位置可见
-    block_mask[:, :, :persist_mem_len, :] = 1
-    
-    # 转换为注意力掩码（0=保留，1=遮罩）
-    block_mask = 1 - block_mask
-    block_mask = block_mask * -1e9
-    return block_mask
-
-# 测试模型生成
-def test_model_generation(model, instruction, device, max_length=100, input_text=""):
-    """测试模型对指令的回答生成能力，支持输入文本"""
-    model.eval()
-    
-    # 准备输入序列
-    inst_tokens = encode_text(instruction).to(device)
-    
-    if input_text:
-        # [INST] instruction [SEP] input [SEP] [ANS]
-        input_tokens = encode_text(input_text).to(device)
-        input_seq = torch.cat([
-            torch.tensor([INSTRUCTION_TOKEN], device=device),
-            inst_tokens,
-            torch.tensor([SEP_TOKEN], device=device),
-            input_tokens,
-            torch.tensor([SEP_TOKEN, ANSWER_TOKEN], device=device)
-        ])
-    else:
-        # [INST] instruction [SEP] [ANS]
-        input_seq = torch.cat([
-            torch.tensor([INSTRUCTION_TOKEN], device=device),
-            inst_tokens,
-            torch.tensor([SEP_TOKEN, ANSWER_TOKEN], device=device)
-        ])
-    
-    # 输出原始提示
-    print(f'指令: {instruction}')
-    if input_text:
-        print(f'输入: {input_text}')
-    print('='*50)
-    
-    # 生成回答
-    with torch.no_grad():
-        output = model.sample(input_seq[None, ...], max_length, use_cache=USE_FAST_INFERENCE)
-    
-    # 解码并显示
-    output_str = decode_tokens(output[0].cpu())
-    answer_part = output_str.split('[ANS]')[-1]  # 获取回答部分
-    
-    print(f'生成回答:')
-    print('-'*50)
-    print(answer_part)
-    print('-'*50)
-    
-    return answer_part
+# 确保checkpoint目录存在
+ensure_dir_exists("checkpoint")
 
 # 设置设备
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"使用设备: {device}")
+logger.info(f"Using device: {device}")
 
-# 显示CUDA信息
+# 显示设备信息
 if torch.cuda.is_available():
-    print(f"CUDA设备数量: {torch.cuda.device_count()}")
-    print(f"CUDA设备名称: {torch.cuda.get_device_name(0)}")
-    print(f"当前CUDA设备: {torch.cuda.current_device()}")
-    print(f"CUDA可用内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-
-# 创建记忆模型
-if USE_MEM_ATTENTION_MODEL:
-    neural_memory_model = MemoryAttention(
-        dim = DIM
-    )
+  logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+  logger.info(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+  logger.info(f"Current CUDA device: {torch.cuda.current_device()}")
+  logger.info(f"Available memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 else:
-    neural_memory_model = MemoryMLP(
-        dim = DIM,
-        depth = MEMORY_DEPTH
-    )
+  logger.info(f"Running on CPU - PyTorch Version: {torch.__version__}")
 
-print("创建模型...")
-
-# 修补titans_pytorch中的函数
-try:
-    from titans_pytorch.mac_transformer import create_mac_block_mask
-    import types
+def load_model_and_tokenizer():
+  """加载模型和tokenizer"""
+  global model, tokenizer
+  
+  try:
+    logger.info(f"Loading model: {MODEL_NAME}")
     
-    # 仅当原始函数存在时尝试替换
-    if hasattr(create_mac_block_mask, '__module__') and 'titans_pytorch.mac_transformer' in create_mac_block_mask.__module__:
-        import titans_pytorch.mac_transformer
-        titans_pytorch.mac_transformer.create_mac_block_mask = create_custom_mac_block_mask
-        print("成功修补create_mac_block_mask函数")
-except Exception as e:
-    print(f"警告: 无法修补create_mac_block_mask: {e}")
-
-# 创建模型实例
-try:
-    model = MemoryAsContextTransformer(
-        num_tokens = 512,  # 基本ASCII + 特殊标记
-        dim = DIM,
-        depth = DEPTH,
-        segment_len = WINDOW_SIZE,
-        num_persist_mem_tokens = NUM_PERSIST_MEM,
-        num_longterm_mem_tokens = NUM_LONGTERM_MEM,
-        neural_memory_layers = NEURAL_MEM_LAYERS,
-        neural_memory_segment_len = MEM_SEGMENT_LEN,
-        neural_memory_batch_size = MEM_BATCH_SIZE,
-        neural_mem_gate_attn_output = NEURAL_MEM_GATE_ATTN_OUTPUT,
-        neural_mem_weight_residual = NEURAL_MEM_WEIGHT_RESIDUAL,
-        neural_memory_qkv_receives_diff_views = NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW,
-        use_flex_attn = USE_FLEX_ATTN,
-        sliding_window_attn = SLIDING_WINDOWS,
-        dim_head = DIM_HEAD,
-        heads = HEADS,
-        neural_memory_model = neural_memory_model,
-        neural_memory_kwargs = dict(
-            attn_pool_chunks = STORE_ATTN_POOL_CHUNKS,
-            qk_rmsnorm = NEURAL_MEM_QK_NORM,
-            momentum = NEURAL_MEM_MOMENTUM,
-            momentum_order = NEURAL_MEM_MOMENTUM_ORDER,
-            default_step_transform_max_lr = NEURAL_MEM_MAX_LR,
-            use_accelerated_scan = USE_ACCELERATED_SCAN,
-            per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR
-        )
-    ).to(device)
-    print("模型创建成功")
-except Exception as e:
-    print(f"创建模型错误: {e}")
-    raise
-
-class InstructionAnswerDataset(Dataset):
-    """用于处理指令-回答对的数据集"""
-    def __init__(self, data_file, max_len=512):  # 增加最大长度以适应wiki数据
-        super().__init__()
-        self.max_len = max_len
-        self.data = []
-        
-        # 加载数据
-        print(f"加载数据文件: {data_file}")
-        try:
-            # 判断文件类型（json或jsonl）
-            if data_file.endswith('.jsonl'):
-                # JSONL格式处理 - 一行一个JSON对象
-                with open(data_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if line.strip():  # 跳过空行
-                            try:
-                                item = json.loads(line)
-                                # wiki3数据格式适配
-                                instruction = item.get('instruction', '')
-                                answer = item.get('output', '') or item.get('answer', '')
-                                input_text = item.get('input', '')
-                                
-                                # 编码并添加到数据中
-                                encoded = encode_instruction_answer_pair(instruction, answer, input_text)
-                                if len(encoded) <= self.max_len:
-                                    self.data.append(encoded)
-                                else:
-                                    print(f"警告: 序列长度 {len(encoded)} 超过最大长度 {self.max_len}，跳过")
-                            except json.JSONDecodeError:
-                                print(f"警告: 跳过无效的JSONL行")
-            else:
-                # 常规JSON文件处理
-                with open(data_file, 'r', encoding='utf-8') as f:
-                    raw_data = json.load(f)
-                    
-                # 处理数据
-                for item in raw_data:
-                    if 'instruction' in item and ('answer' in item or 'output' in item):
-                        instruction = item['instruction']
-                        answer = item.get('output', '') or item.get('answer', '')
-                        input_text = item.get('input', '')
-                        
-                        # 编码并添加到数据中
-                        encoded = encode_instruction_answer_pair(instruction, answer, input_text)
-                        if len(encoded) <= self.max_len:
-                            self.data.append(encoded)
-                        else:
-                            print(f"警告: 序列长度 {len(encoded)} 超过最大长度 {self.max_len}，跳过")
-                    
-            print(f"成功加载 {len(self.data)} 个指令-回答对")
-        except Exception as e:
-            print(f"加载数据失败: {e}")
-            # 创建一些示例数据用于测试
-            self._create_sample_data()
-    
-    def _create_sample_data(self):
-        """创建样本数据用于测试"""
-        print("创建样本数据...")
-        sample_pairs = [
-            ("What is Project Zomboid?", "Project Zomboid is a zombie survival game with an emphasis on realistic survival mechanics."),
-            ("How do I find food in Project Zomboid?", "Look for food in refrigerators, cabinets, and grocery stores. You can also forage, fish, farm and trap animals."),
-            ("What weapons are good for beginners?", "Baseball bats, kitchen knives, and hammers are good starting weapons. Avoid firearms until you have higher skills."),
-            ("How do I heal injuries?", "Use bandages for cuts, splints for fractures, and painkillers for pain. Rest accelerates healing."),
-            ("What is the most dangerous zombie?", "Sprinters are the most dangerous as they can catch up to you quickly. Avoid them if possible.")
-        ]
-        
-        for instruction, answer in sample_pairs:
-            encoded = encode_instruction_answer_pair(instruction, answer)
-            self.data.append(encoded)
-        
-        print(f"创建了 {len(self.data)} 个样本数据对")
-
-    def __getitem__(self, index):
-        # 选择一个数据条目
-        item = self.data[index]
-        
-        # 如果序列长度不足，进行填充
-        if len(item) < self.max_len:
-            padding = torch.full((self.max_len - len(item),), PAD_TOKEN, dtype=torch.long)
-            item = torch.cat([item, padding])
-        
-        return item.to(device)
-
-    def __len__(self):
-        return len(self.data)
-
-def create_or_load_datasets(data_file="data/wiki3.jsonl"):
-    """创建或加载数据集"""
-    # 确保数据目录存在
-    os.makedirs(os.path.dirname(data_file), exist_ok=True)
-    
-    # 检查数据文件是否存在
-    if not os.path.exists(data_file):
-        print(f"数据文件 {data_file} 不存在，创建示例数据...")
-        # 创建示例数据
-        sample_data = []
-        sample_pairs = [
-            {"instruction": "What is Project Zomboid?", 
-             "answer": "Project Zomboid is a zombie survival game with an emphasis on realistic survival mechanics."},
-            {"instruction": "How do I find food in Project Zomboid?", 
-             "answer": "Look for food in refrigerators, cabinets, and grocery stores. You can also forage, fish, farm and trap animals."},
-            {"instruction": "What weapons are good for beginners?", 
-             "answer": "Baseball bats, kitchen knives, and hammers are good starting weapons. Avoid firearms until you have higher skills."},
-            {"instruction": "How do I heal injuries?", 
-             "answer": "Use bandages for cuts, splints for fractures, and painkillers for pain. Rest accelerates healing."},
-            {"instruction": "What is the most dangerous zombie?", 
-             "answer": "Sprinters are the most dangerous as they can catch up to you quickly. Avoid them if possible."}
-        ]
-        
-        # 添加更多随机的指令-回答对
-        for i in range(20):
-            instruction = f"This is test instruction {i+1}. Please respond appropriately."
-            answer = f"I understand your instruction {i+1}. Here is my response with some context about zombies and survival techniques."
-            sample_pairs.append({"instruction": instruction, "answer": answer})
-        
-        # 保存示例数据
-        out_file = data_file.replace('.jsonl', '.json') if data_file.endswith('.jsonl') else data_file
-        with open(out_file, 'w', encoding='utf-8') as f:
-            json.dump(sample_pairs, f, ensure_ascii=False, indent=2)
-    
-    print(f"开始加载数据集: {data_file}")
-    # 创建数据集
-    full_dataset = InstructionAnswerDataset(data_file)
-    
-    print(f"全数据集大小: {len(full_dataset)} 样本")
-    
-    # 分割数据集时，确保PZ相关数据分布均衡
-    train_size = int(0.9 * len(full_dataset))  # 增加训练集比例到90%
-    val_size = len(full_dataset) - train_size
-    
-    if val_size == 0:
-        # 数据太少，只用于训练
-        train_dataset = full_dataset
-        val_dataset = full_dataset
-        print("警告: 数据量太小，验证集与训练集相同")
-    else:
-        # 随机分割
-        # 设置随机种子确保可重复性
-        torch.manual_seed(42)
-        indices = torch.randperm(len(full_dataset))
-        
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:]
-        
-        train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-        val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
-        
-        print(f"训练集大小: {len(train_dataset)} 样本")
-        print(f"验证集大小: {len(val_dataset)} 样本")
-    
-    return train_dataset, val_dataset
-
-# 创建数据集和数据加载器
-print("创建数据集...")
-train_dataset, val_dataset = create_or_load_datasets()
-train_loader = cycle(DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0))
-val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0))
-
-# 初始化优化器
-print("初始化优化器...")
-optim = AdoptAtan2(model.parameters(), lr=LEARNING_RATE)
-
-# 保存检查点函数
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint.pt"):
-    # 确保checkpoint目录存在
-    os.makedirs("checkpoint", exist_ok=True)
-    
-    # 保存在checkpoint目录
-    filepath = os.path.join("checkpoint", filename)
-    
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss
+    # 模型配置
+    model_kwargs = {
+      "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+      "low_cpu_mem_usage": True
     }
+    
+    # 根据设备设置适当的加载参数
+    if torch.cuda.is_available():
+      logger.info("Loading model with CUDA optimizations")
+      model_kwargs.update({
+        "device_map": "auto",
+        "max_memory": {0: "7GiB"}  # 限制GPU内存使用
+      })
+    
+    # 加载模型
+    model = AutoModelForCausalLM.from_pretrained(
+      MODEL_NAME,
+      **model_kwargs
+    )
+    
+    # 使用标准方式加载tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    
+    # Qwen3已经有pad_token，不需要额外设置
+    if tokenizer.pad_token is None:
+      tokenizer.pad_token = tokenizer.eos_token
+    
+    # 设置生成配置
+    model.generation_config.temperature = generation_config["temperature"]
+    model.generation_config.top_p = generation_config["top_p"] 
+    model.generation_config.top_k = generation_config["top_k"]
+    model.generation_config.presence_penalty = generation_config["presence_penalty"]
+    
+    logger.info(f"Model loaded: {model.config}")
+    
+    # 确认模型是否在CUDA上
+    logger.info(f"Model is on CUDA: {next(model.parameters()).is_cuda}")
+    if torch.cuda.is_available():
+      logger.info(f"CUDA memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+      logger.info(f"CUDA memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+  except Exception as e:
+    logger.error(f"Error loading model: {e}")
+    raise
+    
+  return model, tokenizer
+
+def load_instruction_dataset(data_file=None):
+  """加载指令数据集"""
+  if data_file is None:
+    data_file = get_data_file_path("wiki3.jsonl")
+    
+  # 确保数据目录存在
+  ensure_dir_exists(os.path.dirname(data_file))
+  
+  data_items = []
+  
+  # 加载数据
+  logger.info(f"Loading data file: {data_file}")
+  try:
+    # 判断文件类型（json或jsonl）
+    if data_file.endswith('.jsonl'):
+      # JSONL格式处理 - 一行一个JSON对象
+      with open(data_file, 'r', encoding='utf-8') as f:
+        for line in f:
+          if line.strip():  # 跳过空行
+            try:
+              item = json.loads(line)
+              data_items.append(item)
+            except json.JSONDecodeError:
+              logger.warning(f"Skipping invalid JSONL line")
+    else:
+      # 常规JSON文件处理
+      with open(data_file, 'r', encoding='utf-8') as f:
+        raw_data = json.load(f)
+        
+      # 处理数据
+      for item in raw_data:
+        if 'instruction' in item and ('answer' in item or 'output' in item):
+          data_items.append(item)
+          
+    logger.info(f"Successfully loaded {len(data_items)} instruction-answer pairs")
+    
+    if len(data_items) == 0:
+      raise ValueError("No valid data items found")
+      
+  except Exception as e:
+    logger.error(f"Failed to load data: {e}")
+    # 创建一些示例数据用于测试
+    logger.info("Creating sample data...")
+    data_items = _create_sample_data()
+  
+  return data_items
+
+def _create_sample_data():
+  """创建样本数据用于测试"""
+  sample_pairs = [
+    {
+      "instruction": "What is Project Zomboid?", 
+      "answer": "Project Zomboid is a zombie survival game with an emphasis on realistic survival mechanics."
+    },
+    {
+      "instruction": "How do I find food in Project Zomboid?", 
+      "answer": "Look for food in refrigerators, cabinets, and grocery stores. You can also forage, fish, farm and trap animals."
+    },
+    {
+      "instruction": "What weapons are good for beginners?", 
+      "answer": "Baseball bats, kitchen knives, and hammers are good starting weapons. Avoid firearms until you have higher skills."
+    },
+    {
+      "instruction": "How do I heal injuries?", 
+      "answer": "Use bandages for cuts, splints for fractures, and painkillers for pain. Rest accelerates healing."
+    },
+    {
+      "instruction": "What is the most dangerous zombie?", 
+      "answer": "Sprinters are the most dangerous as they can catch up to you quickly. Avoid them if possible."
+    }
+  ]
+  
+  # 添加更多随机的指令-回答对
+  for i in range(20):
+    instruction = f"This is test instruction {i+1}. Please respond appropriately."
+    answer = f"I understand your instruction {i+1}. Here is my response with some context about zombies and survival techniques."
+    sample_pairs.append({"instruction": instruction, "answer": answer})
+  
+  logger.info(f"Created {len(sample_pairs)} sample data pairs")
+  return sample_pairs
+
+def load_system_prompt(prompt_file="data/pz_system_prompt.txt"):
+  """加载系统提示"""
+  try:
+    with open(prompt_file, 'r', encoding='utf-8') as f:
+      return f.read().strip()
+  except Exception as e:
+    logger.warning(f"无法加载系统提示文件 {prompt_file}: {e}")
+    return "You are an AI assistant providing helpful information about Project Zomboid, a zombie survival game."
+
+def prepare_dataset(data_items):
+  """准备数据集"""
+  processed_data = []
+  
+  # 加载系统提示
+  system_prompt = load_system_prompt()
+  logger.info(f"Loaded system prompt ({len(system_prompt)} chars)")
+  
+  for item in data_items:
+    instruction = item.get("instruction", "")
+    answer = item.get("output", "") or item.get("answer", "")
+    input_text = item.get("input", "")
+    
+    if not answer:
+      logger.warning(f"Skipping item with empty answer: {instruction}")
+      continue
+      
+    # 清理回答，移除<think>...</think>标签和内容
+    clean_answer = answer
+    if "<think>" in answer and "</think>" in answer:
+      think_parts = answer.split("</think>")
+      if len(think_parts) > 1:
+        clean_answer = think_parts[1].strip()
+    
+    if "<answer>" in clean_answer:
+      clean_answer = clean_answer.replace("<answer>", "").replace("</answer>", "")
+      
+    # 创建消息格式 - 适用于Qwen3，包含系统提示
+    messages = [
+      {"role": "system", "content": system_prompt},
+      {"role": "user", "content": instruction if not input_text else f"{instruction}\n\n{input_text}"},
+      {"role": "assistant", "content": clean_answer}
+    ]
+    
+    processed_data.append({
+      "messages": messages
+    })
+  
+  # 使用正确的方法创建数据集
+  return HFDataset.from_list(processed_data)
+
+def format_instruction_dataset(examples, tokenizer):
+  """将数据集格式化为模型输入格式"""
+  formatted_texts = []
+  
+  for messages in examples["messages"]:
     try:
-        torch.save(checkpoint, filepath)
-        print(f"检查点已保存到 {filepath}")
+      formatted_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False
+      )
+      formatted_texts.append(formatted_text)
     except Exception as e:
-        print(f"保存检查点错误: {e}")
+      logger.error(f"Error formatting message: {e}")
+      logger.error(f"Message content: {messages}")
+      # 使用简单格式作为fallback
+      user_content = messages[0]["content"] if len(messages) > 0 else ""
+      assistant_content = messages[1]["content"] if len(messages) > 1 else ""
+      formatted_text = f"<|user|>\n{user_content}<|endoftext|>\n<|assistant|>\n{assistant_content}<|endoftext|>"
+      formatted_texts.append(formatted_text)
+  
+  return {"text": formatted_texts}
 
-# 加载检查点函数
-def load_checkpoint(model, optimizer, checkpoint_path):
-    try:
-        print(f"尝试加载检查点: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch']
-        loss = checkpoint['loss']
-        print(f"成功加载检查点，批次: {start_epoch}, 损失: {loss:.4f}")
-        return start_epoch
-    except Exception as e:
-        print(f"加载检查点失败: {e}")
-        return 0
+def test_model_generation(model, tokenizer, prompt, max_length=100):
+  """测试模型生成能力"""
+  logger.info(f"Testing generation for prompt: {prompt}")
+  
+  # 为Qwen3模型准备输入格式
+  messages = [{"role": "user", "content": prompt}]
+  try:
+    formatted_prompt = tokenizer.apply_chat_template(
+      messages,
+      tokenize=False,
+      add_generation_prompt=True
+    )
+  except Exception as e:
+    logger.error(f"Error applying chat template: {e}")
+    # Fallback to simple format
+    formatted_prompt = f"<|user|>\n{prompt}<|endoftext|>\n<|assistant|>\n"
+  
+  inputs = tokenizer(formatted_prompt, return_tensors="pt")
+  
+  # 如果使用CUDA，把input_ids和attention_mask移到GPU上
+  if torch.cuda.is_available():
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+  
+  # 生成文本 - 使用更安全的设置避免断言错误
+  try:
+    with torch.no_grad():
+      generated_ids = model.generate(
+        **inputs,
+        max_length=max_length,
+        num_return_sequences=1,
+        do_sample=True,
+        temperature=0.8,  # 略微增加温度
+        top_p=0.95,
+        top_k=50,  # 增加候选token
+        repetition_penalty=1.1,  # 添加重复惩罚而不是presence_penalty
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        attention_mask=inputs.get("attention_mask", None)  # 确保传递注意力掩码
+      )
+      
+    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+  except Exception as e:
+    logger.error(f"Error in generation: {e}")
+    generated_text = "Error generating text with GPU. Falling back to simple output."
+    # 尝试CPU回退
+    if torch.cuda.is_available():
+      try:
+        logger.info("Attempting CPU fallback for generation...")
+        model_cpu = model.to('cpu')
+        inputs_cpu = {k: v.to('cpu') for k, v in inputs.items()}
+        
+        with torch.no_grad():
+          generated_ids = model_cpu.generate(
+            **inputs_cpu,
+            max_length=max_length,
+            num_return_sequences=1,
+            do_sample=False,  # 使用greedy解码更安全
+            num_beams=1
+          )
+        
+        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        # 把模型移回GPU
+        model.to(device)
+      except Exception as inner_e:
+        logger.error(f"CPU fallback also failed: {inner_e}")
+  
+  # 输出生成的文本
+  logger.info(f"指令: {prompt}")
+  logger.info("="*50)
+  logger.info(f"生成回答: {generated_text}")
+  logger.info("="*50)
+  return generated_text
 
-# 尝试加载先前的检查点
-start_batch = 0
-checkpoint_files = ["instruction_final.pt", "instruction_checkpoint_50.pt"]
-for checkpoint_file in checkpoint_files:
-    checkpoint_path = os.path.join("checkpoint", checkpoint_file)
-    if os.path.exists(checkpoint_path):
-        start_batch = load_checkpoint(model, optim, checkpoint_path)
-        if start_batch > 0:
-            start_batch += 1
-            print(f"从批次 {start_batch} 继续训练")
-            break
+# 创建自定义Trainer类来处理损失计算
+class CausalLMTrainer(Trainer):
+  def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    """
+    修改计算损失的方法确保正确计算语言模型损失
+    """
+    if "labels" not in inputs:
+      # 如果没有标签，我们将输入IDs作为标签
+      inputs["labels"] = inputs["input_ids"].clone()
+      # 可选地设置填充标记为-100
+      if self.tokenizer.pad_token_id is not None:
+        labels = inputs["labels"].detach().clone()
+        pad_mask = labels == self.tokenizer.pad_token_id
+        labels[pad_mask] = -100
+        inputs["labels"] = labels
+    
+    # 打印设备信息以确认是否在CUDA上
+    if hasattr(self, "_print_device_info") and self._print_device_info:
+      logger.info(f"Compute loss - Input IDs device: {inputs['input_ids'].device}")
+      logger.info(f"Model device: {next(model.parameters()).device}")
+      self._print_device_info = False
+    
+    outputs = model(**inputs)
+    loss = outputs.loss
+    
+    return (loss, outputs) if return_outputs else loss
+  
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._print_device_info = True  # 第一次计算损失时打印设备信息
 
-# 记录损失
-train_losses = []
-val_losses = []
+def optimize_model_for_training(model, use_fp32=True):
+  """优化模型配置以便进行训练"""
+  if model is None:
+    return None
+    
+  # 针对Qwen3模型的优化
+  if "qwen" in model.config.model_type.lower():
+    logger.info("Applying Qwen-specific optimizations")
+    
+    # 减少注意力头数量以节省内存
+    if hasattr(model.config, "num_attention_heads") and model.config.num_attention_heads > 8:
+      logger.info(f"Original attention heads: {model.config.num_attention_heads}")
+      # Qwen3的注意力头是内部参数，不应修改
+    
+    # 确保模型处于正确的数据类型
+    if use_fp32 and next(model.parameters()).dtype == torch.float16:
+      logger.info("Converting model from fp16 to fp32 for training stability")
+      model = model.to(torch.float32)
+    
+    # 确保滑动窗口关闭以提高训练效率
+    if hasattr(model.config, "use_sliding_window"):
+      original_value = model.config.use_sliding_window
+      model.config.use_sliding_window = False
+      logger.info(f"Disabled sliding window for training (was: {original_value})")
+    
+    # 禁用KV缓存以节省内存
+    if hasattr(model.config, "use_cache"):
+      original_value = model.config.use_cache
+      model.config.use_cache = False
+      logger.info(f"Disabled KV cache for training (was: {original_value})")
+      
+  return model
 
-# 训练循环
-print(f"开始训练 {NUM_BATCHES} 批次...")
-try:
-    best_val_loss = float('inf')
-    patience_counter = 0
-    patience_limit = 5  # 连续5次验证损失没有改善就降低学习率
+def main():
+  """主函数"""
+  global model, tokenizer
+  
+  # 加载模型和tokenizer
+  model, tokenizer = load_model_and_tokenizer()
+  
+  # 为训练优化模型
+  model = optimize_model_for_training(model, use_fp32=True)
+  
+  # 加载数据
+  data_items = load_instruction_dataset()
+  
+  # 为了节省内存，只使用部分数据
+  if len(data_items) > 100:
+    logger.info(f"Using only 100 examples out of {len(data_items)} to save memory")
+    # 随机选择100个样本
+    random.seed(42)
+    data_items = random.sample(data_items, 100)
+  
+  # 准备数据集
+  dataset = prepare_dataset(data_items)
+  logger.info(f"Prepared dataset with {len(dataset)} examples")
+  
+  # 分割数据集
+  train_size = int(0.9 * len(dataset))
+  val_size = len(dataset) - train_size
+  
+  if val_size == 0:
+    # 数据太少，只用于训练
+    train_dataset = dataset
+    val_dataset = dataset
+    logger.warning("Warning: Too few data, validation set is the same as training set")
+  else:
+    # 随机分割
+    dataset = dataset.shuffle(seed=42)
+    train_dataset = dataset.select(range(train_size))
+    val_dataset = dataset.select(range(train_size, len(dataset)))
     
-    for i in tqdm.tqdm(range(start_batch, NUM_BATCHES), mininterval=1., desc='训练中'):
-        model.train()
-        
-        # 梯度累积
-        total_loss = 0
-        for _ in range(GRADIENT_ACCUMULATE_EVERY):
-            try:
-                data_batch = next(train_loader)
-                loss = model(data_batch, return_loss=True)
-                loss = loss / GRADIENT_ACCUMULATE_EVERY
-                loss.backward()
-                total_loss += loss.item()
-            except Exception as e:
-                print(f"训练批次 {i} 错误: {e}")
-                import traceback
-                traceback.print_exc()
-                break
-        
-        # 记录损失
-        train_loss = total_loss
-        train_losses.append(train_loss)
-        
-        print(f'批次 {i+1}/{NUM_BATCHES}, 训练损失: {train_loss:.4f}')
-        
-        # 梯度裁剪防止爆炸
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        
-        # 优化器步骤
-        optim.step()
-        optim.zero_grad()
-        
-        # 保存检查点
-        if i % SAVE_EVERY == 0 and i > 0:
-            try:
-                save_checkpoint(model, optim, i, train_loss, f"instruction_checkpoint_{i}.pt")
-            except Exception as e:
-                print(f"批次 {i} 保存检查点失败: {e}")
-        
-        # 验证阶段
-        if i % VALIDATE_EVERY == 0:
-            model.eval()
-            with torch.no_grad():
-                try:
-                    val_data_batch = next(val_loader)
-                    val_loss = model(val_data_batch, return_loss=True)
-                    current_val_loss = val_loss.item()
-                    val_losses.append(current_val_loss)
-                    print(f'验证损失: {current_val_loss:.4f}')
-                    
-                    # 学习率调度 - 如果验证损失连续多次没有改善，降低学习率
-                    if current_val_loss < best_val_loss:
-                        best_val_loss = current_val_loss
-                        patience_counter = 0
-                        # 保存最佳模型
-                        save_checkpoint(model, optim, i, current_val_loss, "instruction_best.pt")
-                        print(f"新的最佳验证损失: {best_val_loss:.4f}, 已保存最佳模型")
-                    else:
-                        patience_counter += 1
-                        print(f"验证损失未改善，耐心计数: {patience_counter}/{patience_limit}")
-                        
-                        if patience_counter >= patience_limit:
-                            # 降低学习率
-                            for param_group in optim.param_groups:
-                                param_group['lr'] *= 0.5  # 学习率减半
-                            new_lr = param_group['lr']
-                            print(f"降低学习率至: {new_lr}")
-                            patience_counter = 0  # 重置耐心计数器
-                except Exception as e:
-                    print(f"验证错误: {e}")
-        
-        # 生成文本样本
-        if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
-            try:
-                print(f"\n批次 {i+1} 生成样本:")
-                sample_instructions = [
-                    "What critical survival action should the agent take immediately upon hearing an approaching helicopter while outdoors?",
-                    "How can the agent gain advance warning of the helicopter event during Days 6-9, including the specific tool and frequency to monitor?"
-                ]
-                for inst in sample_instructions:
-                    test_model_generation(model, inst, device, GENERATE_LENGTH)
-            except Exception as e:
-                print(f"生成错误: {e}")
+    logger.info(f"Training set size: {len(train_dataset)} examples")
+    logger.info(f"Validation set size: {len(val_dataset)} examples")
+  
+  # 格式化数据集
+  formatted_train_dataset = train_dataset.map(
+    lambda examples: format_instruction_dataset(examples, tokenizer),
+    batched=True,
+    remove_columns=train_dataset.column_names
+  )
+  
+  formatted_val_dataset = val_dataset.map(
+    lambda examples: format_instruction_dataset(examples, tokenizer),
+    batched=True,
+    remove_columns=val_dataset.column_names
+  )
+  
+  # Tokenize数据集
+  def tokenize_function(examples):
+    """对文本进行标记，并准备用于训练的数据格式"""
+    # 获取文本
+    texts = examples["text"]
+    result = tokenizer(
+      texts,
+      truncation=True,
+      max_length=MAX_LENGTH,
+      padding="max_length",
+      return_attention_mask=True
+    )
     
-    # 完成训练
-    print(f"训练完成，共 {NUM_BATCHES} 批次!")
+    # 添加标签 - 语言模型训练中，标签与输入相同
+    result["labels"] = result["input_ids"].copy()
     
-    # 保存最终检查点
-    final_loss = train_losses[-1] if train_losses else 0
-    save_checkpoint(model, optim, NUM_BATCHES, final_loss, "instruction_final.pt")
+    return result
+  
+  tokenized_train_dataset = formatted_train_dataset.map(
+    tokenize_function,
+    batched=True,
+    remove_columns=["text"]
+  )
+  
+  tokenized_val_dataset = formatted_val_dataset.map(
+    tokenize_function,
+    batched=True,
+    remove_columns=["text"]
+  )
+  
+  # 打印数据集示例
+  logger.info("Dataset example:")
+  try:
+    sample_item = tokenized_train_dataset[0]
+    logger.info(f"Example 1:")
+    logger.info(f"Input IDs type: {type(sample_item['input_ids'])}")
+    logger.info(f"Input IDs first few tokens: {sample_item['input_ids'][:10]}")
+    logger.info(f"Attention mask first few tokens: {sample_item['attention_mask'][:10]}")
+    logger.info(f"Decoded text start: {tokenizer.decode(sample_item['input_ids'][:50])}...")
+  except Exception as e:
+    logger.error(f"Error inspecting dataset: {e}")
+    # 打印原始数据集的内容
+    logger.info(f"Raw dataset first item: {formatted_train_dataset[0]}")
     
-    # 保存损失历史
-    np.save("instruction_train_losses.npy", np.array(train_losses))
-    np.save("instruction_val_losses.npy", np.array(val_losses))
+    # 尝试修复数据集
+    logger.info("Attempting to fix dataset format...")
+    # 确保数据集格式正确
+    from transformers import DefaultDataCollator
+    data_collator = DefaultDataCollator()
+  
+  # 创建Data Collator - 使用特别为因果语言模型设计的数据整理器
+  from transformers import DataCollatorForLanguageModeling
+  
+  # 使用适合因果语言模型的数据整理器
+  data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False  # 不使用掩码语言模型（MLM），而是使用因果语言模型（CLM）
+  )
+  
+  # 设置训练参数 - 关闭fp16导致的梯度问题
+  use_fp16 = False
+  
+  training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    overwrite_output_dir=True,
+    num_train_epochs=NUM_EPOCHS,
+    per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+    learning_rate=LEARNING_RATE,
+    weight_decay=0.01,
+    warmup_ratio=0.1,
+    logging_dir=get_logs_dir(),  # 使用path_manager
+    logging_steps=5,  # 更频繁地记录日志
+    save_strategy="epoch",
+    save_total_limit=1,  # 只保留最近的1个检查点
+    # CUDA设置 - 关闭fp16避免梯度问题
+    fp16=use_fp16,
+    bf16=False,
+    # GPU设置
+    no_cuda=False,  # 允许使用CUDA
+    dataloader_num_workers=0,  # 不使用多进程以节省内存
+    auto_find_batch_size=True,  # 自动调整批量大小以避免OOM
+    # 使用合适的优化器
+    optim="adamw_torch",  # 使用PyTorch的AdamW优化器
+    # 其他设置
+    remove_unused_columns=True,  # 移除不使用的列以节省内存
+    group_by_length=True,  # 按序列长度分组以减少填充
+    report_to="none",  # 不报告给任何平台
+    # 避免GPU断言错误的设置
+    ddp_find_unused_parameters=False,
+    use_legacy_prediction_loop=True,
+    label_smoothing_factor=0.0,
+    # 禁用梯度缩放以避免FP16梯度问题
+    gradient_checkpointing=True,  # 启用梯度检查点以节省内存
+    max_grad_norm=1.0,  # 设置梯度裁剪以避免爆炸梯度
+  )
+  
+  # 使用自定义Trainer进行训练
+  trainer = CausalLMTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_train_dataset,
+    eval_dataset=tokenized_val_dataset,
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+  )
+  
+  # 开始训练
+  logger.info("Starting training...")
+  try:
+    # 确保模型在正确的设备上
+    if torch.cuda.is_available() and not next(model.parameters()).is_cuda:
+      logger.info("Moving model to CUDA manually...")
+      model = model.to(device)
+      logger.info(f"After moving, model is on CUDA: {next(model.parameters()).is_cuda}")
     
-    # 最终评估
-    print("最终模型评估:")
+    # 打印训练配置信息
+    logger.info(f"Training on device: {device}")
+    logger.info(f"FP16 enabled: {training_args.fp16}")
+    logger.info(f"Model dtype: {next(model.parameters()).dtype}")
+    logger.info(f"Training batch size: {training_args.per_device_train_batch_size}")
+    logger.info(f"Gradient accumulation steps: {training_args.gradient_accumulation_steps}")
+    
+    # 开始训练
+    trainer.train()
+    
+    # 保存最终模型
+    logger.info("Saving model...")
+    final_model_path = get_final_model_path()
+    trainer.save_model(final_model_path)
+    tokenizer.save_pretrained(final_model_path)
+    logger.info(f"Training completed! Model saved to {final_model_path}")
+    
+    # 测试最终模型
     if SHOULD_GENERATE:
-        test_instructions = [
-            "What critical survival action should the agent take immediately upon hearing an approaching helicopter while outdoors?",
-            "How can the agent gain advance warning of the helicopter event during Days 6-9, including the specific tool and frequency to monitor?",
-            "What specific steps must the agent follow to obtain gasoline from a gas station pump after the main power grid has shut off?",
-            "What type of location is a house heavily barricaded with wooden planks from the outside likely to be, and what tools are needed to remove the external barricades?",
-            "What potential delayed consequence might occur after the agent sustains a scratch from a zombie, and if the \"Sick\" moodle appears afterward, what is the most likely cause and outcome?"
-        ]
-        for inst in test_instructions:
-            test_model_generation(model, inst, device, GENERATE_LENGTH)
-
-except KeyboardInterrupt:
-    print("用户中断训练")
-    try:
-        current_batch = start_batch + len(train_losses)
-        current_loss = train_losses[-1] if train_losses else 0
-        save_checkpoint(model, optim, current_batch, current_loss, "instruction_interrupted.pt")
-        print(f"已保存中断检查点，批次 {current_batch}")
-    except:
-        print("中断时无法保存检查点")
-except Exception as e:
-    print(f"训练过程错误: {e}")
+      logger.info("Testing final model...")
+      
+      # 恢复模型生成设置
+      logger.info("Restoring model generation settings...")
+      if hasattr(model.config, "use_cache"):
+        model.config.use_cache = True
+        logger.info("Re-enabled KV cache for generation")
+        
+      # 确保模型在评估模式
+      model.eval()
+      
+      test_prompts = [
+        "What critical survival action should the agent take immediately upon hearing an approaching helicopter while outdoors?",
+        "How can the agent gain advance warning of the helicopter event during Days 6-9, including the specific tool and frequency to monitor?",
+        "What specific steps must the agent follow to obtain gasoline from a gas station pump after the main power grid has shut off?",
+        "What type of location is a house heavily barricaded with wooden planks from the outside likely to be, and what tools are needed to remove the external barricades?",
+        "What potential delayed consequence might occur after the agent sustains a scratch from a zombie, and if the \"Sick\" moodle appears afterward, what is the most likely cause and outcome?"
+      ]
+      
+      for prompt in test_prompts:
+        test_model_generation(model, tokenizer, prompt, GENERATE_LENGTH)
+        
+  except KeyboardInterrupt:
+    logger.info("Training interrupted by user")
+    # 保存中断时的模型
+    interrupted_model_path = get_interrupted_model_path()
+    trainer.save_model(interrupted_model_path)
+    tokenizer.save_pretrained(interrupted_model_path)
+    logger.info(f"Saved interrupted model checkpoint to {interrupted_model_path}")
+    
+  except Exception as e:
+    logger.error(f"Training error: {e}")
     import traceback
-    traceback.print_exc() 
+    traceback.print_exc()
+
+if __name__ == "__main__":
+  main() 
