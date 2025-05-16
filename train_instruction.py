@@ -18,7 +18,8 @@ from titans_pytorch.path_manager import (
   get_final_model_path,
   get_interrupted_model_path,
   get_logs_dir,
-  ensure_dir_exists
+  ensure_dir_exists,
+  get_checkpoint_dir
 )
 
 # 禁用PyTorch动态编译和JIT
@@ -293,12 +294,19 @@ def format_instruction_dataset(examples, tokenizer):
   
   return {"text": formatted_texts}
 
-def test_model_generation(model, tokenizer, prompt, max_length=100):
+def test_model_generation(model, tokenizer, prompt, max_new_tokens=100):
   """测试模型生成能力"""
   logger.info(f"Testing generation for prompt: {prompt}")
   
-  # 为Qwen3模型准备输入格式
-  messages = [{"role": "user", "content": prompt}]
+  # 加载系统提示
+  system_prompt = load_system_prompt()
+  
+  # 为Qwen3模型准备输入格式，包含系统提示
+  messages = [
+    {"role": "system", "content": system_prompt},
+    {"role": "user", "content": prompt}
+  ]
+  
   try:
     formatted_prompt = tokenizer.apply_chat_template(
       messages,
@@ -308,7 +316,7 @@ def test_model_generation(model, tokenizer, prompt, max_length=100):
   except Exception as e:
     logger.error(f"Error applying chat template: {e}")
     # Fallback to simple format
-    formatted_prompt = f"<|user|>\n{prompt}<|endoftext|>\n<|assistant|>\n"
+    formatted_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
   
   inputs = tokenizer(formatted_prompt, return_tensors="pt")
   
@@ -319,21 +327,30 @@ def test_model_generation(model, tokenizer, prompt, max_length=100):
   # 生成文本 - 使用更安全的设置避免断言错误
   try:
     with torch.no_grad():
+      # 修复：使用max_new_tokens而不是max_length
+      generation_kwargs = {
+        "max_new_tokens": max_new_tokens,  # 使用max_new_tokens而不是max_length
+        "num_return_sequences": 1,
+        "do_sample": True,  # 确保启用采样
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "top_k": 50,
+        "repetition_penalty": 1.1,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+      }
+      
+      # 不要在这里包含attention_mask
       generated_ids = model.generate(
-        **inputs,
-        max_length=max_length,
-        num_return_sequences=1,
-        do_sample=True,
-        temperature=0.8,  # 略微增加温度
-        top_p=0.95,
-        top_k=50,  # 增加候选token
-        repetition_penalty=1.1,  # 添加重复惩罚而不是presence_penalty
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        attention_mask=inputs.get("attention_mask", None)  # 确保传递注意力掩码
+        input_ids=inputs["input_ids"],
+        **generation_kwargs
       )
       
     generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    
+    # 添加：清理生成的文本，处理<think>标签
+    generated_text = clean_generated_text(generated_text)
+    
   except Exception as e:
     logger.error(f"Error in generation: {e}")
     generated_text = "Error generating text with GPU. Falling back to simple output."
@@ -346,14 +363,22 @@ def test_model_generation(model, tokenizer, prompt, max_length=100):
         
         with torch.no_grad():
           generated_ids = model_cpu.generate(
-            **inputs_cpu,
-            max_length=max_length,
+            input_ids=inputs_cpu["input_ids"],
+            max_new_tokens=max_new_tokens,  # 同样使用max_new_tokens
             num_return_sequences=1,
-            do_sample=False,  # 使用greedy解码更安全
-            num_beams=1
+            do_sample=True,  # 保持一致的采样设置
+            temperature=0.8,
+            top_p=0.95,
+            top_k=50,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id
           )
         
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        # 清理CPU回退生成的文本
+        generated_text = clean_generated_text(generated_text)
+        
         # 把模型移回GPU
         model.to(device)
       except Exception as inner_e:
@@ -365,6 +390,43 @@ def test_model_generation(model, tokenizer, prompt, max_length=100):
   logger.info(f"生成回答: {generated_text}")
   logger.info("="*50)
   return generated_text
+
+def clean_generated_text(text):
+  """清理生成的文本，移除特殊标签和不必要的内容"""
+  # 处理思考标签：移除<think>...</think>及其内容
+  while "<think>" in text and "</think>" in text:
+    think_start = text.find("<think>")
+    think_end = text.find("</think>", think_start) + len("</think>")
+    if think_start != -1 and think_end != -1:
+      text = text[:think_start] + text[think_end:]
+    else:
+      break  # 防止无限循环
+  
+  # 清理其他标签
+  tags_to_remove = [
+    "<s>", "</s>", "<system>", "</system>", "<human>", "</human>", 
+    "<assistant>", "</assistant>", "<output>", "</output>", "<o>", "</o>",
+    "<input>", "</input>", "<i>", "</i>"
+  ]
+  
+  for tag in tags_to_remove:
+    text = text.replace(tag, "")
+  
+  # 处理ChatML格式的特殊情况
+  if "<|im_start|>" in text:
+    # 尝试提取助手回复部分
+    parts = text.split("<|im_start|>assistant")
+    if len(parts) > 1:
+      # 获取助手部分并清理
+      assistant_part = parts[1]
+      if "<|im_end|>" in assistant_part:
+        assistant_part = assistant_part.split("<|im_end|>")[0]
+      text = assistant_part.strip()
+    
+  # 处理多余的空白字符
+  text = " ".join(text.split())
+  
+  return text.strip()
 
 # 创建自定义Trainer类来处理损失计算
 class CausalLMTrainer(Trainer):
@@ -624,13 +686,21 @@ def main():
       
       # 恢复模型生成设置
       logger.info("Restoring model generation settings...")
-      if hasattr(model.config, "use_cache"):
-        model.config.use_cache = True
-        logger.info("Re-enabled KV cache for generation")
-        
-      # 确保模型在评估模式
-      model.eval()
       
+      # 恢复模型生成设置
+      if hasattr(model.config, "use_cache"):
+        original_use_cache = model.config.use_cache
+        model.config.use_cache = True
+        logger.info(f"Re-enabled KV cache for generation (was: {original_use_cache})")
+        
+      # 确保模型处于评估模式
+      model.eval()
+      logger.info("Model set to evaluation mode")
+      
+      # 记录当前模型配置
+      logger.info(f"Generation config: temperature={generation_config['temperature']}, top_p={generation_config['top_p']}")
+      
+      # 测试提示
       test_prompts = [
         "What critical survival action should the agent take immediately upon hearing an approaching helicopter while outdoors?",
         "How can the agent gain advance warning of the helicopter event during Days 6-9, including the specific tool and frequency to monitor?",
@@ -639,8 +709,34 @@ def main():
         "What potential delayed consequence might occur after the agent sustains a scratch from a zombie, and if the \"Sick\" moodle appears afterward, what is the most likely cause and outcome?"
       ]
       
-      for prompt in test_prompts:
-        test_model_generation(model, tokenizer, prompt, GENERATE_LENGTH)
+      # 每个生成的令牌数量
+      test_generate_tokens = 256  # 增加生成长度来获得更完整的回答
+      
+      # 逐个测试生成
+      all_results = []
+      for i, prompt in enumerate(test_prompts):
+        logger.info(f"Testing generation {i+1}/{len(test_prompts)}")
+        try:
+          # 在每次生成前确保GPU内存清理
+          if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+          # 进行文本生成
+          generated_text = test_model_generation(model, tokenizer, prompt, test_generate_tokens)
+          all_results.append({"prompt": prompt, "response": generated_text})
+          
+        except Exception as e:
+          logger.error(f"Error generating response for prompt {i+1}: {e}")
+          all_results.append({"prompt": prompt, "response": f"Error: {str(e)}"})
+          
+      # 保存生成结果
+      try:
+        result_path = os.path.join(get_checkpoint_dir(), "generation_results.json")
+        with open(result_path, "w", encoding="utf-8") as f:
+          json.dump(all_results, f, ensure_ascii=False, indent=2)
+        logger.info(f"Generation results saved to {result_path}")
+      except Exception as e:
+        logger.error(f"Failed to save generation results: {e}")
         
   except KeyboardInterrupt:
     logger.info("Training interrupted by user")
