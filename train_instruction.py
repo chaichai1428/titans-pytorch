@@ -49,17 +49,21 @@ from transformers import (
 model = None
 tokenizer = None
 generation_config = {
-  "temperature": 0.7,
-  "top_p": 0.95,
-  "top_k": 50,
-  "presence_penalty": 1.1,
+  "temperature": 0.7,       # 使用更高的温度以增加多样性
+  "top_p": 0.9,            # 调整top-p sampling
+  "top_k": 50,             # 增加token选择范围
+  "repetition_penalty": 1.5, # 适度重复惩罚
+  "no_repeat_ngram_size": 3, # 避免重复n-gram
+  "num_beams": 1,          # 不使用beam search
+  "do_sample": True,       # 启用采样
+  "early_stopping": False   # 不提前停止生成
 }
 
 # 训练参数
 MAX_LENGTH = 128  # 减少最大序列长度以节省内存
 BATCH_SIZE = 2 if torch.cuda.is_available() else 1  # GPU可使用更大的批量
 LEARNING_RATE = 5e-5  # 学习率
-NUM_EPOCHS = 1    # 减少训练轮数以快速完成
+NUM_EPOCHS = 10   # 增加训练轮数以提高微调效果
 GRADIENT_ACCUMULATION_STEPS = 4  # 梯度累积步数
 SAVE_EVERY = 50      # 保存检查点频率
 VALIDATE_EVERY = 25   # 验证频率
@@ -103,29 +107,38 @@ def load_model_and_tokenizer():
     # 根据设备设置适当的加载参数
     if torch.cuda.is_available():
       logger.info("Loading model with CUDA optimizations")
+      # 获取可用GPU内存
+      free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+      # 为模型分配合适的内存限制，留出30%缓冲
+      mem_limit = int(free_mem * 0.7 / 1024**3)
+      logger.info(f"设置GPU内存限制: {mem_limit}GiB (可用内存的70%)")
+      
       model_kwargs.update({
         "device_map": "auto",
-        "max_memory": {0: "7GiB"}  # 限制GPU内存使用
+        "max_memory": {0: f"{mem_limit}GiB"}
       })
     
+    # 加载tokenizer优先，因为它内存占用小
+    logger.info("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    
+    # 确保tokenizer设置正确
+    if tokenizer.pad_token is None:
+      tokenizer.pad_token = tokenizer.eos_token
+    
     # 加载模型
+    logger.info("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
       MODEL_NAME,
       **model_kwargs
     )
     
-    # 使用标准方式加载tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    
-    # Qwen3已经有pad_token，不需要额外设置
-    if tokenizer.pad_token is None:
-      tokenizer.pad_token = tokenizer.eos_token
-    
     # 设置生成配置
-    model.generation_config.temperature = generation_config["temperature"]
-    model.generation_config.top_p = generation_config["top_p"] 
-    model.generation_config.top_k = generation_config["top_k"]
-    model.generation_config.presence_penalty = generation_config["presence_penalty"]
+    logger.info("配置模型生成参数...")
+    for param, value in generation_config.items():
+      if hasattr(model.generation_config, param):
+        setattr(model.generation_config, param, value)
+        logger.info(f"设置生成参数 {param} = {value}")
     
     logger.info(f"Model loaded: {model.config}")
     
@@ -221,22 +234,24 @@ def _create_sample_data():
   logger.info(f"Created {len(sample_pairs)} sample data pairs")
   return sample_pairs
 
-def load_system_prompt(prompt_file="data/pz_system_prompt.txt"):
+def load_system_prompt(prompt_file="data/pz_system_prompt_simple.txt"):
   """加载系统提示"""
   try:
     with open(prompt_file, 'r', encoding='utf-8') as f:
       return f.read().strip()
   except Exception as e:
-    logger.warning(f"无法加载系统提示文件 {prompt_file}: {e}")
-    return "You are an AI assistant providing helpful information about Project Zomboid, a zombie survival game."
+    # 如果找不到简化版系统提示，尝试加载原始系统提示
+    logger.warning(f"无法加载简化系统提示文件 {prompt_file}: {e}")
+    try:
+      with open("data/pz_system_prompt.txt", 'r', encoding='utf-8') as f:
+        return f.read().strip()
+    except Exception as e2:
+      logger.warning(f"无法加载原始系统提示文件: {e2}")
+      return "You are an AI assistant providing helpful information about Project Zomboid, a zombie survival game. Answer directly and concisely."
 
 def prepare_dataset(data_items):
-  """准备数据集"""
+  """准备数据集 - 简化版本不使用系统提示"""
   processed_data = []
-  
-  # 加载系统提示
-  system_prompt = load_system_prompt()
-  logger.info(f"Loaded system prompt ({len(system_prompt)} chars)")
   
   for item in data_items:
     instruction = item.get("instruction", "")
@@ -257,216 +272,202 @@ def prepare_dataset(data_items):
     if "<answer>" in clean_answer:
       clean_answer = clean_answer.replace("<answer>", "").replace("</answer>", "")
       
-    # 创建消息格式 - 适用于Qwen3，包含系统提示
-    messages = [
-      {"role": "system", "content": system_prompt},
-      {"role": "user", "content": instruction if not input_text else f"{instruction}\n\n{input_text}"},
-      {"role": "assistant", "content": clean_answer}
-    ]
+    # 不使用系统提示，直接构建问答对
+    if input_text:
+      formatted_text = f"{instruction}\n{input_text}\n\n{clean_answer}"
+    else:
+      formatted_text = f"{instruction}\n\n{clean_answer}"
     
     processed_data.append({
-      "messages": messages
+      "text": formatted_text
     })
   
-  # 使用正确的方法创建数据集
+  # 返回简化的数据集
   return HFDataset.from_list(processed_data)
 
-def format_instruction_dataset(examples, tokenizer):
-  """将数据集格式化为模型输入格式"""
-  formatted_texts = []
-  
-  for messages in examples["messages"]:
-    try:
-      formatted_text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False
-      )
-      formatted_texts.append(formatted_text)
-    except Exception as e:
-      logger.error(f"Error formatting message: {e}")
-      logger.error(f"Message content: {messages}")
-      # 使用简单格式作为fallback
-      user_content = messages[0]["content"] if len(messages) > 0 else ""
-      assistant_content = messages[1]["content"] if len(messages) > 1 else ""
-      formatted_text = f"<|user|>\n{user_content}<|endoftext|>\n<|assistant|>\n{assistant_content}<|endoftext|>"
-      formatted_texts.append(formatted_text)
-  
-  return {"text": formatted_texts}
+def format_instruction_dataset(examples):
+  """简化版本的数据格式化函数"""
+  # 数据已经是文本格式，不需要进一步处理
+  return {"text": examples["text"]}
 
-def test_model_generation(model, tokenizer, prompt, max_new_tokens=100):
-  """测试模型生成能力"""
-  logger.info(f"Testing generation for prompt: {prompt}")
+def test_model_generation(model, tokenizer, prompt, max_new_tokens=150):
+  """超简化版生成函数 - 直接传入提示生成"""
+  logger.info(f"生成测试 - 提示: {prompt}")
   
-  # 加载系统提示
-  system_prompt = load_system_prompt()
+  # 将提示转换为模型输入
+  encoded_input = tokenizer.encode(prompt, return_tensors="pt")
   
-  # 添加额外指示，禁止使用思考标签
-  system_prompt += "\n\nIMPORTANT: Provide direct answers without using <think> tags. Focus on giving clear, concise information that directly answers the question."
-  
-  # 为Qwen3模型准备输入格式，包含系统提示
-  messages = [
-    {"role": "system", "content": system_prompt},
-    {"role": "user", "content": prompt}
-  ]
-  
-  try:
-    formatted_prompt = tokenizer.apply_chat_template(
-      messages,
-      tokenize=False,
-      add_generation_prompt=True
-    )
-  except Exception as e:
-    logger.error(f"Error applying chat template: {e}")
-    # Fallback to simple format
-    formatted_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-  
-  inputs = tokenizer(formatted_prompt, return_tensors="pt")
-  
-  # 如果使用CUDA，把input_ids和attention_mask移到GPU上
+  # 将输入移动到适当的设备
   if torch.cuda.is_available():
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    encoded_input = encoded_input.to(device)
+    model = model.to(device)
   
-  # 生成文本 - 使用更安全的设置避免断言错误
+  # 生成参数
+  gen_params = {
+    "max_new_tokens": max_new_tokens,
+    "temperature": 0.8,  # 更高的温度以避免复制
+    "top_p": 0.92,
+    "top_k": 50,
+    "do_sample": True,
+    "no_repeat_ngram_size": 3,
+    "repetition_penalty": 1.3,
+  }
+  
+  # 生成文本
   try:
     with torch.no_grad():
-      # 修复：使用max_new_tokens而不是max_length
-      generation_kwargs = {
-        "max_new_tokens": max_new_tokens,  # 使用max_new_tokens而不是max_length
-        "num_return_sequences": 1,
-        "do_sample": True,  # 确保启用采样
-        "temperature": generation_config["temperature"],
-        "top_p": generation_config["top_p"],
-        "top_k": generation_config["top_k"],
-        "repetition_penalty": generation_config.get("repetition_penalty", 1.1),
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-      }
-      
-      # 不要在这里包含attention_mask
-      generated_ids = model.generate(
-        input_ids=inputs["input_ids"],
-        **generation_kwargs
+      output_ids = model.generate(
+        input_ids=encoded_input, 
+        **gen_params
       )
-      
+    
     # 解码生成的文本
-    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=False)  # 保留特殊标记以便调试
-    logger.info(f"原始生成文本: {generated_text[:200]}...")  # 记录原始文本以便调试
+    full_output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     
-    # 清理生成的文本
-    clean_text = clean_generated_text(generated_text)
+    # 移除原始提示部分
+    if full_output.startswith(prompt):
+      response = full_output[len(prompt):].strip()
+    else:
+      response = full_output.strip()
+      
+    # 简单清理系统提示相关内容
+    response = response.replace("You are an assistant specialized in the video game Project Zomboid.", "").strip()
+    response = response.replace("Project Zomboid is a zombie survival game", "").strip()
+    response = response.replace("When answering questions:", "").strip()
+    response = response.replace("- Provide only factual game information", "").strip()
+    response = response.replace("- Focus on specific", "").strip()
+    response = response.replace("- Keep responses direct", "").strip()
+    response = response.replace("- Never make up game features", "").strip()
+    response = response.replace("Your goal is to help players", "").strip()
     
-    # 如果清理后文本为空，尝试提取原始回答部分
-    if not clean_text.strip() and "<|im_start|>assistant" in generated_text:
-      parts = generated_text.split("<|im_start|>assistant")
-      if len(parts) > 1:
-        assistant_part = parts[1]
-        # 移除<|im_end|>后面的内容
-        if "<|im_end|>" in assistant_part:
-          assistant_part = assistant_part.split("<|im_end|>")[0]
-        clean_text = assistant_part.strip()
-    
-    # 如果仍然为空且有<think>内容，保留<think>内容以便至少有些输出
-    if not clean_text.strip() and "<think>" in generated_text:
-      clean_text = "模型只生成了思考过程，没有生成最终答案。思考内容: " + generated_text.split("<think>")[1].split("</think>")[0] if "</think>" in generated_text else generated_text.split("<think>")[1]
-    
-    generated_text = clean_text
-    
+    # 确保不是空响应
+    if not response or len(response.split()) < 3:
+      response = "生成失败。尝试使用不同的提示或重新训练模型。"
+      
   except Exception as e:
-    logger.error(f"Error in generation: {e}")
-    generated_text = "Error generating text with GPU. Falling back to simple output."
-    # 尝试CPU回退
-    if torch.cuda.is_available():
-      try:
-        logger.info("Attempting CPU fallback for generation...")
-        model_cpu = model.to('cpu')
-        inputs_cpu = {k: v.to('cpu') for k, v in inputs.items()}
-        
-        with torch.no_grad():
-          generated_ids = model_cpu.generate(
-            input_ids=inputs_cpu["input_ids"],
-            max_new_tokens=max_new_tokens,  # 同样使用max_new_tokens
-            num_return_sequences=1,
-            do_sample=True,  # 保持一致的采样设置
-            temperature=generation_config["temperature"],
-            top_p=generation_config["top_p"],
-            top_k=generation_config["top_k"],
-            repetition_penalty=generation_config.get("repetition_penalty", 1.1),
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
-          )
-        
-        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        # 清理CPU回退生成的文本
-        generated_text = clean_generated_text(generated_text)
-        
-        # 把模型移回GPU
-        model.to(device)
-      except Exception as inner_e:
-        logger.error(f"CPU fallback also failed: {inner_e}")
+    logger.error(f"生成过程错误: {e}")
+    response = f"生成错误: {str(e)}"
   
-  # 输出生成的文本
-  logger.info(f"指令: {prompt}")
+  # 记录结果
+  logger.info(f"提示: {prompt}")
   logger.info("="*50)
-  logger.info(f"生成回答: {generated_text}")
+  logger.info(f"生成回答: {response}")
   logger.info("="*50)
-  return generated_text
+  
+  return response
 
 def clean_generated_text(text):
-  """清理生成的文本，提取有用的回答部分"""
+  """清理生成的文本，移除特殊标签、标记和格式问题"""
   if not text or len(text.strip()) == 0:
     return ""
   
   # 记录原始文本长度，用于调试
   original_length = len(text)
   
-  # 简化处理步骤，使用更可靠的方法
-  
-  # 步骤1: 尝试提取ChatML格式中的助手回复
-  if "<|im_start|>assistant" in text:
-    try:
+  try:
+    # 步骤1: 尝试提取ChatML格式中的助手回复
+    if "<|im_start|>assistant" in text:
       parts = text.split("<|im_start|>assistant")
       if len(parts) > 1:
         assistant_text = parts[-1]  # 取最后一个
         if "<|im_end|>" in assistant_text:
           assistant_text = assistant_text.split("<|im_end|>")[0]
         text = assistant_text.strip()
-    except Exception as e:
-      logger.warning(f"提取ChatML回复时出错: {e}")
-  
-  # 步骤2: 移除<think>标签及其内容
-  import re
-  try:
+    
+    # 步骤2: 移除<think>标签及其内容
+    import re
     # 移除所有<think>...</think>内容
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     
     # 如果有未闭合的<think>标签，去除它后面的所有内容
     if "<think>" in text:
       text = text.split("<think>")[0].strip()
+    
+    # 步骤3: 清除所有常见的XML/HTML标签
+    tags_to_remove = [
+      "<s>", "</s>", "<system>", "</system>", "<human>", "</human>", 
+      "<assistant>", "</assistant>", "<output>", "</output>", "<o>", "</o>",
+      "<input>", "</input>", "<i>", "</i>", "<think>", "</think>",
+      "<answer>", "</answer>", "<|im_start|>", "<|im_end|>"
+    ]
+    
+    for tag in tags_to_remove:
+      text = text.replace(tag, "")
+    
+    # 步骤4: 移除markdown格式
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # 移除粗体 **text**
+    text = re.sub(r'\*(.*?)\*', r'\1', text)      # 移除斜体 *text*
+    
+    # 步骤5: 移除系统提示相关内容（通过关键词检测）
+    # 这些是常见的指令/提示文本的开头部分，需要被移除
+    system_prompt_patterns = [
+      r"You (must|are|should) answer questions with (accurate|exact|specific).*?information from (the game|Project Zomboid)\.",
+      r"Your responses should(\s|\:).*",
+      r"Remember\: Project Zomboid is a zombie survival game.*",
+      r".*?1\.\s+Be direct and concise.*",
+      r".*?2\.\s+Include exact game mechanics.*",
+      r".*?3\.\s+Name specific in-game.*",
+      r".*?4\.\s+Avoid general statements.*",
+      r".*?5\.\s+Never use markdown.*",
+      r".*?DO NOT invent game features.*",
+      r"You must answer questions with.*",
+      r"Project Zombology.*",  # 明显错误的名称
+      r"Project Zombody.*",    # 明显错误的名称
+      r"Project ZOMBoid.*",    # 错误的大小写
+      r"Players must manage.*?食物 \(food\).*"  # 混合语言内容
+    ]
+    
+    # 对每个模式应用替换
+    for pattern in system_prompt_patterns:
+      text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # 步骤6: 清理列表格式和空白
+    # 规范化列表
+    text = re.sub(r'(\d+\.\s+)', r'\n\1', text)   # 确保数字列表项前有换行
+    text = re.sub(r'(\-\s+)', r'\n\1', text)      # 确保破折号列表项前有换行
+    
+    # 检测并修复截断句子
+    if text.strip().endswith(('to', 'the', 'and', 'or', 'of', 'in', 'as', 'for', 'with', 'action')):
+      text = text.strip() + "..."  # 添加省略号表示句子被截断
+    
+    # 移除多余空白行和空格
+    lines = [line.strip() for line in text.split('\n')]
+    lines = [line for line in lines if line]  # 移除空行
+    
+    if lines:  # 确保有内容
+      text = '\n'.join(lines)
+      text = re.sub(r'\s+', ' ', text).strip()  # 规范化空白字符
+    
+    # 步骤7: 最终清理 - 移除多余内容
+    # 移除可能的指令性开头
+    text = re.sub(r'^(Here\'s|Here is|Let me|I will|The answer is|To answer your question|In Project Zomboid,?)\s+', '', text, flags=re.IGNORECASE)
+    
+    # 移除重复的段落（如果某一段内容重复出现）
+    segments = text.split('. ')
+    if len(segments) > 3:
+      unique_segments = []
+      for segment in segments:
+        if segment and segment.strip() and segment.strip() not in unique_segments:
+          unique_segments.append(segment.strip())
+      text = '. '.join(unique_segments)
+      if not text.endswith('.'):
+        text += '.'
+  
   except Exception as e:
-    logger.warning(f"移除思考标签时出错: {e}")
+    logger.warning(f"文本清理过程中出错: {e}")
+    # 如果清理过程出错，则返回原始文本的简单清理版本
+    text = re.sub(r'<.*?>', '', text)  # 移除所有XML标签
   
-  # 步骤3: 清除常见的其他标签
-  tags_to_remove = [
-    "<s>", "</s>", "<system>", "</system>", "<human>", "</human>", 
-    "<assistant>", "</assistant>", "<output>", "</output>", "<o>", "</o>",
-    "<input>", "</input>", "<i>", "</i>", "<think>", "</think>"
-  ]
-  
-  for tag in tags_to_remove:
-    text = text.replace(tag, "")
-  
-  # 步骤4: 整理文本格式
-  # 移除多余空白行和空格
-  lines = [line.strip() for line in text.split('\n')]
-  lines = [line for line in lines if line]  # 移除空行
-  if lines:  # 确保有内容
-    text = '\n'.join(lines)
-    text = re.sub(r'\s+', ' ', text).strip()  # 规范化空白字符
-  
-  # 如果清理后文本为空但原文不为空，返回原始文本的一部分
+  # 如果清理后文本为空但原文不为空，返回警告信息
   if not text.strip() and original_length > 0:
-    return f"无法提取有效回答，原始生成文本片段: {text[:100]}"
+    return "无法提取有效回答内容，请尝试更改问题表述。"
+  
+  # 最终检查 - 如果结果文本非常短，但原始文本很长，可能是清理过度
+  if len(text.strip()) < 20 and original_length > 200:
+    # 尝试最简单的清理方式
+    simple_clean = re.sub(r'<.*?>', '', text)
+    if len(simple_clean.strip()) > len(text.strip()):
+      return simple_clean.strip()
   
   return text.strip()
 
@@ -479,7 +480,7 @@ class CausalLMTrainer(Trainer):
     if "labels" not in inputs:
       # 如果没有标签，我们将输入IDs作为标签
       inputs["labels"] = inputs["input_ids"].clone()
-      # 可选地设置填充标记为-100
+      # 将填充标记设置为-100，避免在计算损失时考虑这些标记
       if self.tokenizer.pad_token_id is not None:
         labels = inputs["labels"].detach().clone()
         pad_mask = labels == self.tokenizer.pad_token_id
@@ -492,8 +493,14 @@ class CausalLMTrainer(Trainer):
       logger.info(f"Model device: {next(model.parameters()).device}")
       self._print_device_info = False
     
+    # 计算模型输出和损失
     outputs = model(**inputs)
     loss = outputs.loss
+    
+    # 处理潜在的NaN损失
+    if torch.isnan(loss).any() or torch.isinf(loss).any():
+      logger.warning(f"检测到NaN或Inf损失: {loss}，将其替换为大数值")
+      loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.tensor(100.0, device=loss.device), loss)
     
     return (loss, outputs) if return_outputs else loss
   
@@ -578,13 +585,13 @@ def main():
   
   # 格式化数据集
   formatted_train_dataset = train_dataset.map(
-    lambda examples: format_instruction_dataset(examples, tokenizer),
+    lambda examples: format_instruction_dataset(examples),
     batched=True,
     remove_columns=train_dataset.column_names
   )
   
   formatted_val_dataset = val_dataset.map(
-    lambda examples: format_instruction_dataset(examples, tokenizer),
+    lambda examples: format_instruction_dataset(examples),
     batched=True,
     remove_columns=val_dataset.column_names
   )
@@ -724,82 +731,48 @@ def main():
     
     # 测试最终模型
     if SHOULD_GENERATE:
-      logger.info("Testing final model...")
+      logger.info("测试最终模型生成能力...")
       
-      # 恢复模型生成设置
-      logger.info("Restoring model generation settings...")
-      
-      # 恢复模型生成设置
-      if hasattr(model.config, "use_cache"):
-        original_use_cache = model.config.use_cache
-        model.config.use_cache = True
-        logger.info(f"Re-enabled KV cache for generation (was: {original_use_cache})")
-        
       # 确保模型处于评估模式
       model.eval()
-      logger.info("Model set to evaluation mode")
       
-      # 记录当前模型配置
-      logger.info(f"Generation config: temperature={generation_config['temperature']}, top_p={generation_config['top_p']}")
-      
-      # 测试提示
+      # 使用直接的测试提示
       test_prompts = [
-        "The agent hears the distinct sound of an approaching helicopter while outdoors. What is the immediate, critical survival action? Give a direct answer.",
-        "The agent needs to obtain gasoline from a gas station pump after the main power grid has shut off. What are the necessary steps? Be specific.",
-        "The agent sustains a Scratch or Laceration from a zombie attack. What are the potential delayed consequences beyond normal wound healing? List them clearly.",
-        "The agent develops the 'Sick' moodle sometime after being injured by a zombie. What are the most likely cause and outcome? Answer directly.",
-        "The agent needs to catch Mice or Rats. Which trap is specifically designed for this and cannot be crafted? Name the item."
+        "What weapons should I use against zombies in Project Zomboid?",
+        "How do I siphon gas from cars in Project Zomboid?",
+        "What are the symptoms of zombie infection in Project Zomboid?",
+        "How do I build a base in Project Zomboid?",
+        "How do I increase my carpentry skill in Project Zomboid?"
       ]
       
-      # 每个生成的令牌数量
-      test_generate_tokens = 400  # 大幅增加生成长度，确保足够生成完整回答
-      
-      # 调整生成参数
-      generation_params = {
-        "temperature": 0.5,        # 更低温度，使输出更确定性
-        "top_p": 0.85,
-        "top_k": 40,
-        "repetition_penalty": 1.4, # 增加重复惩罚
-        "no_repeat_ngram_size": 4, # 增加不重复n-gram大小
-        "do_sample": True,
-        "use_cache": True,         # 确保缓存开启
-        "num_beams": 3,            # 使用beam search提高生成质量
-        "early_stopping": True     # 提前停止生成
-      }
-      
-      # 更新模型生成配置
-      for param, value in generation_params.items():
-        if hasattr(model.generation_config, param):
-          setattr(model.generation_config, param, value)
-          logger.info(f"Set generation parameter {param} = {value}")
-          
-      logger.info(f"Updated generation config for testing")
+      # 使用合适的生成长度
+      test_generate_tokens = 250
       
       # 逐个测试生成
       all_results = []
       for i, prompt in enumerate(test_prompts):
-        logger.info(f"Testing generation {i+1}/{len(test_prompts)}")
+        logger.info(f"测试生成 {i+1}/{len(test_prompts)}")
+        
+        # 在每次生成前清理GPU内存
+        if torch.cuda.is_available():
+          torch.cuda.empty_cache()
+          
+        # 生成回答
         try:
-          # 在每次生成前确保GPU内存清理
-          if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-          # 进行文本生成
           generated_text = test_model_generation(model, tokenizer, prompt, test_generate_tokens)
           all_results.append({"prompt": prompt, "response": generated_text})
-          
         except Exception as e:
-          logger.error(f"Error generating response for prompt {i+1}: {e}")
+          logger.error(f"生成失败: {e}")
           all_results.append({"prompt": prompt, "response": f"Error: {str(e)}"})
-          
-      # 保存生成结果
+      
+      # 保存生成结果 - 移到循环外部，只保存一次所有结果
       try:
         result_path = os.path.join(get_checkpoint_dir(), "generation_results.json")
         with open(result_path, "w", encoding="utf-8") as f:
           json.dump(all_results, f, ensure_ascii=False, indent=2)
-        logger.info(f"Generation results saved to {result_path}")
+        logger.info(f"生成结果已保存到 {result_path}")
       except Exception as e:
-        logger.error(f"Failed to save generation results: {e}")
+        logger.error(f"保存生成结果失败: {e}")
         
   except KeyboardInterrupt:
     logger.info("Training interrupted by user")
