@@ -301,6 +301,9 @@ def test_model_generation(model, tokenizer, prompt, max_new_tokens=100):
   # 加载系统提示
   system_prompt = load_system_prompt()
   
+  # 添加额外指示，禁止使用思考标签
+  system_prompt += "\n\nIMPORTANT: Provide direct answers without using <think> tags. Focus on giving clear, concise information that directly answers the question."
+  
   # 为Qwen3模型准备输入格式，包含系统提示
   messages = [
     {"role": "system", "content": system_prompt},
@@ -332,10 +335,10 @@ def test_model_generation(model, tokenizer, prompt, max_new_tokens=100):
         "max_new_tokens": max_new_tokens,  # 使用max_new_tokens而不是max_length
         "num_return_sequences": 1,
         "do_sample": True,  # 确保启用采样
-        "temperature": 0.8,
-        "top_p": 0.95,
-        "top_k": 50,
-        "repetition_penalty": 1.1,
+        "temperature": generation_config["temperature"],
+        "top_p": generation_config["top_p"],
+        "top_k": generation_config["top_k"],
+        "repetition_penalty": generation_config.get("repetition_penalty", 1.1),
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
       }
@@ -346,10 +349,28 @@ def test_model_generation(model, tokenizer, prompt, max_new_tokens=100):
         **generation_kwargs
       )
       
-    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    # 解码生成的文本
+    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=False)  # 保留特殊标记以便调试
+    logger.info(f"原始生成文本: {generated_text[:200]}...")  # 记录原始文本以便调试
     
-    # 添加：清理生成的文本，处理<think>标签
-    generated_text = clean_generated_text(generated_text)
+    # 清理生成的文本
+    clean_text = clean_generated_text(generated_text)
+    
+    # 如果清理后文本为空，尝试提取原始回答部分
+    if not clean_text.strip() and "<|im_start|>assistant" in generated_text:
+      parts = generated_text.split("<|im_start|>assistant")
+      if len(parts) > 1:
+        assistant_part = parts[1]
+        # 移除<|im_end|>后面的内容
+        if "<|im_end|>" in assistant_part:
+          assistant_part = assistant_part.split("<|im_end|>")[0]
+        clean_text = assistant_part.strip()
+    
+    # 如果仍然为空且有<think>内容，保留<think>内容以便至少有些输出
+    if not clean_text.strip() and "<think>" in generated_text:
+      clean_text = "模型只生成了思考过程，没有生成最终答案。思考内容: " + generated_text.split("<think>")[1].split("</think>")[0] if "</think>" in generated_text else generated_text.split("<think>")[1]
+    
+    generated_text = clean_text
     
   except Exception as e:
     logger.error(f"Error in generation: {e}")
@@ -367,10 +388,10 @@ def test_model_generation(model, tokenizer, prompt, max_new_tokens=100):
             max_new_tokens=max_new_tokens,  # 同样使用max_new_tokens
             num_return_sequences=1,
             do_sample=True,  # 保持一致的采样设置
-            temperature=0.8,
-            top_p=0.95,
-            top_k=50,
-            repetition_penalty=1.1,
+            temperature=generation_config["temperature"],
+            top_p=generation_config["top_p"],
+            top_k=generation_config["top_k"],
+            repetition_penalty=generation_config.get("repetition_penalty", 1.1),
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id
           )
@@ -392,39 +413,60 @@ def test_model_generation(model, tokenizer, prompt, max_new_tokens=100):
   return generated_text
 
 def clean_generated_text(text):
-  """清理生成的文本，移除特殊标签和不必要的内容"""
-  # 处理思考标签：移除<think>...</think>及其内容
-  while "<think>" in text and "</think>" in text:
-    think_start = text.find("<think>")
-    think_end = text.find("</think>", think_start) + len("</think>")
-    if think_start != -1 and think_end != -1:
-      text = text[:think_start] + text[think_end:]
-    else:
-      break  # 防止无限循环
+  """清理生成的文本，提取有用的回答部分"""
+  if not text or len(text.strip()) == 0:
+    return ""
   
-  # 清理其他标签
+  # 记录原始文本长度，用于调试
+  original_length = len(text)
+  
+  # 简化处理步骤，使用更可靠的方法
+  
+  # 步骤1: 尝试提取ChatML格式中的助手回复
+  if "<|im_start|>assistant" in text:
+    try:
+      parts = text.split("<|im_start|>assistant")
+      if len(parts) > 1:
+        assistant_text = parts[-1]  # 取最后一个
+        if "<|im_end|>" in assistant_text:
+          assistant_text = assistant_text.split("<|im_end|>")[0]
+        text = assistant_text.strip()
+    except Exception as e:
+      logger.warning(f"提取ChatML回复时出错: {e}")
+  
+  # 步骤2: 移除<think>标签及其内容
+  import re
+  try:
+    # 移除所有<think>...</think>内容
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    
+    # 如果有未闭合的<think>标签，去除它后面的所有内容
+    if "<think>" in text:
+      text = text.split("<think>")[0].strip()
+  except Exception as e:
+    logger.warning(f"移除思考标签时出错: {e}")
+  
+  # 步骤3: 清除常见的其他标签
   tags_to_remove = [
     "<s>", "</s>", "<system>", "</system>", "<human>", "</human>", 
     "<assistant>", "</assistant>", "<output>", "</output>", "<o>", "</o>",
-    "<input>", "</input>", "<i>", "</i>"
+    "<input>", "</input>", "<i>", "</i>", "<think>", "</think>"
   ]
   
   for tag in tags_to_remove:
     text = text.replace(tag, "")
   
-  # 处理ChatML格式的特殊情况
-  if "<|im_start|>" in text:
-    # 尝试提取助手回复部分
-    parts = text.split("<|im_start|>assistant")
-    if len(parts) > 1:
-      # 获取助手部分并清理
-      assistant_part = parts[1]
-      if "<|im_end|>" in assistant_part:
-        assistant_part = assistant_part.split("<|im_end|>")[0]
-      text = assistant_part.strip()
-    
-  # 处理多余的空白字符
-  text = " ".join(text.split())
+  # 步骤4: 整理文本格式
+  # 移除多余空白行和空格
+  lines = [line.strip() for line in text.split('\n')]
+  lines = [line for line in lines if line]  # 移除空行
+  if lines:  # 确保有内容
+    text = '\n'.join(lines)
+    text = re.sub(r'\s+', ' ', text).strip()  # 规范化空白字符
+  
+  # 如果清理后文本为空但原文不为空，返回原始文本的一部分
+  if not text.strip() and original_length > 0:
+    return f"无法提取有效回答，原始生成文本片段: {text[:100]}"
   
   return text.strip()
 
@@ -702,15 +744,36 @@ def main():
       
       # 测试提示
       test_prompts = [
-        "What critical survival action should the agent take immediately upon hearing an approaching helicopter while outdoors?",
-        "How can the agent gain advance warning of the helicopter event during Days 6-9, including the specific tool and frequency to monitor?",
-        "What specific steps must the agent follow to obtain gasoline from a gas station pump after the main power grid has shut off?",
-        "What type of location is a house heavily barricaded with wooden planks from the outside likely to be, and what tools are needed to remove the external barricades?",
-        "What potential delayed consequence might occur after the agent sustains a scratch from a zombie, and if the \"Sick\" moodle appears afterward, what is the most likely cause and outcome?"
+        "The agent hears the distinct sound of an approaching helicopter while outdoors. What is the immediate, critical survival action? Give a direct answer.",
+        "The agent needs to obtain gasoline from a gas station pump after the main power grid has shut off. What are the necessary steps? Be specific.",
+        "The agent sustains a Scratch or Laceration from a zombie attack. What are the potential delayed consequences beyond normal wound healing? List them clearly.",
+        "The agent develops the 'Sick' moodle sometime after being injured by a zombie. What are the most likely cause and outcome? Answer directly.",
+        "The agent needs to catch Mice or Rats. Which trap is specifically designed for this and cannot be crafted? Name the item."
       ]
       
       # 每个生成的令牌数量
-      test_generate_tokens = 256  # 增加生成长度来获得更完整的回答
+      test_generate_tokens = 400  # 大幅增加生成长度，确保足够生成完整回答
+      
+      # 调整生成参数
+      generation_params = {
+        "temperature": 0.5,        # 更低温度，使输出更确定性
+        "top_p": 0.85,
+        "top_k": 40,
+        "repetition_penalty": 1.4, # 增加重复惩罚
+        "no_repeat_ngram_size": 4, # 增加不重复n-gram大小
+        "do_sample": True,
+        "use_cache": True,         # 确保缓存开启
+        "num_beams": 3,            # 使用beam search提高生成质量
+        "early_stopping": True     # 提前停止生成
+      }
+      
+      # 更新模型生成配置
+      for param, value in generation_params.items():
+        if hasattr(model.generation_config, param):
+          setattr(model.generation_config, param, value)
+          logger.info(f"Set generation parameter {param} = {value}")
+          
+      logger.info(f"Updated generation config for testing")
       
       # 逐个测试生成
       all_results = []
