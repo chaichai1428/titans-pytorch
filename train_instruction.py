@@ -49,7 +49,7 @@ from transformers import (
 model = None
 tokenizer = None
 generation_config = {
-  "temperature": 0.7,       # 使用更高的温度以增加多样性
+  "temperature": 0.6,       # 使用更高的温度以增加多样性
   "top_p": 0.9,            # 调整top-p sampling
   "top_k": 50,             # 增加token选择范围
   "repetition_penalty": 1.5, # 适度重复惩罚
@@ -62,7 +62,7 @@ generation_config = {
 # 训练参数
 MAX_LENGTH = 128  # 减少最大序列长度以节省内存
 BATCH_SIZE = 2 if torch.cuda.is_available() else 1  # GPU可使用更大的批量
-LEARNING_RATE = 5e-5  # 学习率
+LEARNING_RATE = 2e-5  # 学习率
 NUM_EPOCHS = 10   # 增加训练轮数以提高微调效果
 GRADIENT_ACCUMULATION_STEPS = 4  # 梯度累积步数
 SAVE_EVERY = 50      # 保存检查点频率
@@ -305,7 +305,7 @@ def test_model_generation(model, tokenizer, prompt, max_new_tokens=150):
   # 生成参数
   gen_params = {
     "max_new_tokens": max_new_tokens,
-    "temperature": 0.8,  # 更高的温度以避免复制
+    "temperature": 0.6,  # 更高的温度以避免复制
     "top_p": 0.92,
     "top_k": 50,
     "do_sample": True,
@@ -385,7 +385,7 @@ def clean_generated_text(text):
     
     # 步骤3: 清除所有常见的XML/HTML标签
     tags_to_remove = [
-      "<s>", "</s>", "<system>", "</system>", "<human>", "</human>", 
+      " ", " ", "<system>", "</system>", "<human>", "</human>", 
       "<assistant>", "</assistant>", "<output>", "</output>", "<o>", "</o>",
       "<input>", "</input>", "<i>", "</i>", "<think>", "</think>",
       "<answer>", "</answer>", "<|im_start|>", "<|im_end|>"
@@ -746,7 +746,7 @@ def main():
       ]
       
       # 使用合适的生成长度
-      test_generate_tokens = 250
+      test_generate_tokens = 512
       
       # 逐个测试生成
       all_results = []
